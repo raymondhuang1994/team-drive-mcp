@@ -1,0 +1,95 @@
+import assert from 'node:assert/strict';
+import { Client } from '@modelcontextprotocol/client';
+import { StdioClientTransport } from '@modelcontextprotocol/client/stdio';
+import { cpSync, mkdtempSync, mkdirSync, readFileSync, writeFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { dirname, join, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
+const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
+const temp = mkdtempSync(join(tmpdir(), 'team-drive-smoke-'));
+const source = join(temp, 'source');
+cpSync(join(root, 'examples/sample-drive'), source, { recursive: true });
+const config = join(temp, 'config.json');
+writeFileSync(config, JSON.stringify({ provider: 'local', root: 'source', state_dir: 'state', poll_seconds: 3600, aliases: { 花费: ['支出'] } }));
+const client = new Client({ name: 'team-drive-integration-test', version: '0.1.0' });
+const timings = {};
+async function call(name, args = {}, expectOk = true) {
+  const before = performance.now();
+  const wire = await client.callTool({ name: `team_drive_${name}`, arguments: args });
+  const result = wire.structuredContent;
+  assert.equal(typeof result?.ok, 'boolean');
+  assert.equal(result.ok, expectOk, JSON.stringify(result));
+  assert.ok(Buffer.byteLength(JSON.stringify(result)) <= 65536);
+  timings[name] = Math.round((performance.now() - before) * 100) / 100;
+  return result;
+}
+async function waitForIndex() {
+  for (let i = 0; i < 300; i++) {
+    const status = await call('status');
+    if (status.coverage.inventory_complete && status.coverage.all_present_files_indexed) return status;
+    await new Promise(resolve => setTimeout(resolve, 100));
+  }
+  throw new Error('Index did not become ready for the fixed sample corpus.');
+}
+try {
+  const start = performance.now();
+  await client.connect(new StdioClientTransport({ command: process.execPath, args: [join(root, 'dist/index.js'), '--config', config], stderr: 'pipe' }));
+  const tools = await client.listTools();
+  assert.equal(tools.tools.length, 9);
+  assert.equal(tools.tools.find(t => t.name === 'team_drive_export').annotations.readOnlyHint, false);
+  const status = await waitForIndex();
+  const coldIndexMs = Math.round(performance.now() - start);
+  let list = await call('list', { limit: 2 });
+  const files = [...list.files];
+  while (list.has_more) { list = await call('list', { limit: 2, cursor: list.next_cursor }); files.push(...list.files); }
+  assert.equal(files.length, status.coverage.present_files);
+  assert.equal(new Set(files.map(f => f.file_id)).size, files.length);
+  const hit = await call('search', { query: '星河' });
+  assert.ok(hit.files.some(f => f.path === 'budget-approved.csv'));
+  assert.equal(hit.exhaustive_for_business_totals, false);
+  const chinese = await call('search', { query: '预算' });
+  assert.ok(chinese.files.some(f => f.path === 'terms.md'));
+  const alias = await call('search', { query: '花费' });
+  assert.ok(alias.files.some(f => f.path === 'terms.md'));
+  const file = files.find(f => f.path === 'budget-approved.csv');
+  const inspected = await call('inspect', { file_id: file.file_id });
+  const version = inspected.source_version;
+  let page = await call('read', { file_id: file.file_id, expected_version: version, limit: 1 });
+  const segments = [...page.segments];
+  while (page.has_more) { page = await call('read', { file_id: file.file_id, expected_version: version, limit: 1, cursor: page.next_cursor }); segments.push(...page.segments); }
+  assert.equal(segments.length, 4);
+  const selected = await call('read', { file_id: file.file_id, expected_version: version, selector: { row_start: 2, row_end: 2 } });
+  assert.equal(selected.total_matching_segments, 1);
+  assert.equal(selected.whole_file_in_response, false);
+  assert.equal(selected.segments[0].data.cells[0].value, 'P-001');
+  assert.ok(segments.every(s => s.locator && s.data.cells.length === 8));
+  const cents = text => BigInt(text.replace('.', ''));
+  const rows = segments.slice(1).map(s => s.data.cells.map(c => c.value));
+  assert.equal(rows.reduce((sum, r) => sum + cents(r[4]) - cents(r[5]) - cents(r[6]), 0n), 6999965n);
+  const exported = await call('export', { file_id: file.file_id, expected_version: version });
+  assert.equal(exported.row_count, 4);
+  const exportedRows = readFileSync(join(temp, 'state', exported.artifact_id), 'utf8').trim().split('\n').map(JSON.parse);
+  assert.ok(exportedRows.every(r => r.source_version === version));
+  const tail = await call('search', { query: 'ARCHIVE-END-742' });
+  const tailHit = tail.files.find(f => f.path === 'long-policy.md');
+  assert.ok(tailHit);
+  const tailInspect = await call('inspect', { file_id: tailHit.file_id });
+  const tailRead = await call('read', { file_id: tailHit.file_id, expected_version: tailInspect.source_version, start: tailHit.match.ordinal, limit: 1 });
+  assert.match(tailRead.segments[0].text, /ARCHIVE-END-742/);
+  const pathRejection = await call('list', { prefix: '../outside' }, false);
+  assert.equal(pathRejection.error.code, 'INVALID_PATH');
+  writeFileSync(join(source, 'budget-approved.csv'), readFileSync(join(source, 'budget-approved.csv'), 'utf8').replace('100000.00', '100001.00'));
+  const stale = await call('read', { file_id: file.file_id, expected_version: version }, false);
+  assert.equal(stale.error.code, 'STALE_SOURCE');
+  const refresh = await call('refresh');
+  const job = await call('job_status', { job_id: refresh.job_id });
+  assert.ok(job.job);
+  await waitForIndex();
+  const changed = await call('inspect', { file_id: file.file_id });
+  assert.notEqual(changed.source_version, version);
+  await call('read', { file_id: file.file_id, expected_version: version }, false);
+  const record = { passed: true, tools: tools.tools.length, sampleFiles: files.length, coldIndexMs, lastOperationMs: timings, note: 'Synthetic small-corpus integration measurement, not a production performance promise.' };
+  mkdirSync(join(root, '.local'), { recursive: true });
+  writeFileSync(join(root, '.local/mcp-smoke-result.json'), JSON.stringify(record, null, 2));
+  console.log(JSON.stringify(record, null, 2));
+} finally { await client.close(); rmSync(temp, { recursive: true, force: true }); }

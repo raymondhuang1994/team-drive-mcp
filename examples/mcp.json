@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "team_drive": {
+      "command": "node",
+      "args": ["<absolute-repository-path>/dist/index.js", "--config", "<absolute-repository-path>/examples/config.sample.json"]
+    }
+  }
+}
