@@ -106,15 +106,27 @@ class ReadOnlyTests(unittest.TestCase):
         account = subprocess.run(["whoami", "/user", "/fo", "csv", "/nh"], check=True, capture_output=True, text=True)
         sid = list(csv.reader(io.StringIO(account.stdout.strip())))[0][1]
         self.assertRegex(sid, r"^S-1-[0-9-]+$")
-        deny = "*" + sid + ":(OI)(CI)(W,D,DC)"
+        original = self.file.read_bytes()
+        # Do not deny generic W: it includes synchronization/read-control bits
+        # also requested by normal GENERIC_READ handles. Deny specific mutation
+        # rights while preserving the test's required read/list precondition.
+        # https://learn.microsoft.com/windows-server/administration/windows-commands/icacls
+        deny = "*" + sid + ":(OI)(CI)(WD,AD,WEA,WA,DE,DC)"
         result = subprocess.run(["icacls", str(self.root), "/deny", deny, "/Q"], capture_output=True)
         self.assertEqual(result.returncode, 0, "Failed to apply a test-only read-only DACL")
         try:
+            self.assertEqual(self.file.read_bytes(), original, "The read-only DACL must still permit ordinary file reads")
+            self.assertEqual(len(list(self.root.iterdir())), 2, "The read-only DACL must still permit directory listing")
             with self.assertRaises(PermissionError):
                 with self.file.open("ab") as output:
                     output.write(b"MUST_NOT_WRITE")
             with self.assertRaises(PermissionError):
                 self.file.unlink()
+            with self.assertRaises(PermissionError):
+                with (self.root / "MUST_NOT_CREATE.txt").open("xb") as output:
+                    output.write(b"MUST_NOT_WRITE")
+            with self.assertRaises(PermissionError):
+                self.file.rename(self.root / "MUST_NOT_RENAME.csv")
             self.exercise_all_tools()
         finally:
             if self.engine:
