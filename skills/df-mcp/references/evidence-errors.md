@@ -16,7 +16,9 @@ Use the tool schema and actual result for field names. Preserve these concepts w
 | Condition | Decision |
 |---|---|
 | Tools unavailable / invalid configuration | State the missing runtime or configuration. Do not pretend Skill instructions provide file access. |
-| Source outside root / symlink rejected | Stay within the approved root. A new root requires an explicit configuration decision. |
+| Source outside root / symlink, junction or reparse path rejected | Stay within the approved root. A new root requires an explicit configuration decision. |
+| Root/state identity changed or unsupported Windows location | Stop using the affected configuration. Ask the user to choose a supported ordinary local folder through configuration; do not repair permissions, widen scope, or delete existing data automatically. |
+| Online-only/cloud placeholder or sharing-locked file | Report the excluded file and coverage gap. The user may provide an approved ordinary local copy or close the editing application; do not force hydration or unlock it. |
 | Source missing / deleted | Refresh when appropriate, then locate an authorized replacement. Do not answer from an obsolete cached excerpt. |
 | Index incomplete / failed files | Use only the clearly bounded verified subset. An exhaustive answer remains incomplete until relevant gaps are resolved. |
 | Source or pagination version changed | Restart the affected file read or enumeration. Never join pages from different generations without qualification. |

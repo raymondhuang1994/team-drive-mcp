@@ -1,7 +1,7 @@
 {
   "provider": "local",
   "root": "sample-drive",
-  "state_dir": "../.local/sample-state",
+  "state_dir": "../.local/sample-v02-state",
   "poll_seconds": 30,
   "limits": {
     "max_file_bytes": 268435456,

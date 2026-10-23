@@ -1,7 +1,9 @@
 import assert from 'node:assert/strict';
 import { Client } from '@modelcontextprotocol/client';
 import { StdioClientTransport } from '@modelcontextprotocol/client/stdio';
-import { cpSync, mkdtempSync, mkdirSync, readFileSync, writeFileSync, rmSync } from 'node:fs';
+import { cpSync, mkdtempSync, mkdirSync, readFileSync, writeFileSync, rmSync, readdirSync, statSync } from 'node:fs';
+import { createHash } from 'node:crypto';
+import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -13,6 +15,22 @@ const config = join(temp, 'config.json');
 writeFileSync(config, JSON.stringify({ provider: 'local', root: 'source', state_dir: 'state', poll_seconds: 3600, aliases: { 花费: ['支出'] } }));
 const client = new Client({ name: 'team-drive-integration-test', version: '0.1.0' });
 const timings = {};
+function sourceSnapshot(directory) {
+  const entries = {};
+  function visit(folder, prefix = '') {
+    for (const entry of readdirSync(folder, { withFileTypes: true })) {
+      const path = join(folder, entry.name);
+      const name = `${prefix}${entry.name}`;
+      const metadata = statSync(path);
+      entries[name] = { type: entry.isDirectory() ? 'directory' : 'file', modified: metadata.mtimeMs,
+        digest: entry.isDirectory() ? null : createHash('sha256').update(readFileSync(path)).digest('hex') };
+      if (entry.isDirectory()) visit(path, `${name}/`);
+    }
+  }
+  visit(directory);
+  return entries;
+}
+const originalSources = sourceSnapshot(source);
 async function call(name, args = {}, expectOk = true) {
   const before = performance.now();
   const wire = await client.callTool({ name: `team_drive_${name}`, arguments: args });
@@ -32,6 +50,9 @@ async function waitForIndex() {
   throw new Error('Index did not become ready for the fixed sample corpus.');
 }
 try {
+  const missingConfig = spawnSync(process.execPath, [join(root, 'dist/index.js')], { encoding: 'utf8', timeout: 10_000 });
+  assert.equal(missingConfig.status, 1);
+  assert.match(missingConfig.stderr, /configured source is required/);
   const start = performance.now();
   await client.connect(new StdioClientTransport({ command: process.execPath, args: [join(root, 'dist/index.js'), '--config', config], stderr: 'pipe' }));
   const tools = await client.listTools();
@@ -78,12 +99,20 @@ try {
   assert.match(tailRead.segments[0].text, /ARCHIVE-END-742/);
   const pathRejection = await call('list', { prefix: '../outside' }, false);
   assert.equal(pathRejection.error.code, 'INVALID_PATH');
+  assert.deepEqual(sourceSnapshot(source), originalSources, 'Every read/index/export operation must preserve source names, contents and modification times.');
   writeFileSync(join(source, 'budget-approved.csv'), readFileSync(join(source, 'budget-approved.csv'), 'utf8').replace('100000.00', '100001.00'));
   const stale = await call('read', { file_id: file.file_id, expected_version: version }, false);
   assert.equal(stale.error.code, 'STALE_SOURCE');
   const refresh = await call('refresh');
   const job = await call('job_status', { job_id: refresh.job_id });
   assert.ok(job.job);
+  for (let i = 0; i < 300; i++) {
+    const current = await call('job_status', { job_id: refresh.job_id });
+    if (current.job.status === 'complete') break;
+    assert.ok(!['failed', 'cancelled', 'interrupted'].includes(current.job.status));
+    if (i === 299) throw new Error('Refresh did not complete.');
+    await new Promise(resolve => setTimeout(resolve, 100));
+  }
   await waitForIndex();
   const changed = await call('inspect', { file_id: file.file_id });
   assert.notEqual(changed.source_version, version);

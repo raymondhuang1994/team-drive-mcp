@@ -1,6 +1,0 @@
-interface:
-  display_name: "Team Drive Reader"
-  short_description: "Read team files with versions, citations and explicit coverage"
-  default_prompt: "Use $team-drive-read to find the approved source, read the relevant evidence, and cite its version and location."
-policy:
-  allow_implicit_invocation: true

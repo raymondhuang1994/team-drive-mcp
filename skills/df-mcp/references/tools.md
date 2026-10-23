@@ -1,6 +1,6 @@
 # Tool contract quick reference
 
-These inputs describe the initial local release. The connected server's declared schema is authoritative if versions differ. Limits below use defaults, not performance guarantees.
+These inputs describe the local reader. The Skill is named `df-mcp`; the `team_drive_` tool prefix is retained for compatibility. The connected server's declared schema is authoritative if versions differ. Limits below use defaults, not performance guarantees.
 
 | Tool | Inputs | Key result / next step |
 |---|---|---|
@@ -44,7 +44,7 @@ List/search cursors bind method, query, index generation and server session. Ins
 
 Default source limit: 256 MiB; uncompressed/output budget: 512 MiB; parser time: 30 seconds per file; maximum 100,000 segments, 8,000 text characters per segment, 512 columns and 2,000 PDF pages. The protocol result budget is 64 KiB and a serialized source segment may not exceed 48 KiB. A limit can reject a file smaller than the byte ceiling if its structure is unusually expensive.
 
-Linux parser workers additionally have an address-space limit. macOS uses input, archive, output and time bounds without the same hard address-space guarantee. Do not claim uniform memory protection or measured capacity across platforms.
+Linux parser workers additionally have an address-space limit. macOS and Windows use input, archive, output and time bounds without the same hard address-space guarantee. Do not claim uniform memory protection or measured capacity across platforms.
 
 ## Example call chain
 

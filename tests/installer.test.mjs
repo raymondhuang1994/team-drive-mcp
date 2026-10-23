@@ -1,0 +1,192 @@
+import assert from 'node:assert/strict';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join, relative } from 'node:path';
+import test from 'node:test';
+import { defaultStateBase, makePlan, parseArguments, preflightRoot, repositoryRoot, runConfigure, shellQuote, windowsFolderPicker } from '../scripts/configure.mjs';
+import { discoverPython } from '../scripts/installer-utils.mjs';
+import { installSkill } from '../scripts/install-skill.mjs';
+
+function fixture(t) {
+  const base = realpathSync.native(mkdtempSync(join(tmpdir(), 'df-mcp-install-')));
+  const repo = join(base, 'installation');
+  const source = join(base, '资料 空格');
+  const state = join(base, 'private state');
+  mkdirSync(repo); mkdirSync(source);
+  writeFileSync(join(source, '预算.txt'), 'read-only source evidence\n');
+  t.after(() => { try { chmodSync(source, 0o700); chmodSync(join(source, '预算.txt'), 0o600); } catch {} rmSync(base, { recursive: true, force: true }); });
+  return { base, repo, source, state };
+}
+function runtime(f, extra = {}) {
+  let output = '';
+  return { repo: f.repo, interactive: false, validateRoot: () => {}, output: { write: (text) => { output += text; } }, getOutput: () => output, ...extra };
+}
+function args(f) { return ['--root', f.source, '--state-dir', f.state, '--yes']; }
+function fakeSkill(repo) {
+  mkdirSync(join(repo, 'skills', 'df-mcp'), { recursive: true });
+  writeFileSync(join(repo, 'skills', 'df-mcp', 'SKILL.md'), '---\nname: df-mcp\ndescription: Fixture.\n---\nRead only.\n');
+}
+
+test('explicit source with Chinese/spaces creates only private configuration, never indexes or modifies source', async (t) => {
+  const f = fixture(t);
+  const original = readFileSync(join(f.source, '预算.txt'));
+  const r = runtime(f);
+  const result = await runConfigure(args(f), r);
+  assert.equal(result.plan.root, f.source);
+  assert.equal(result.config.state_dir, result.plan.state);
+  assert.ok(existsSync(result.plan.configPath));
+  assert.equal(existsSync(result.plan.state), false);
+  assert.deepEqual(readFileSync(join(f.source, '预算.txt')), original);
+  assert.match(r.getOutput(), /READ ONLY/);
+  assert.match(r.getOutput(), /codex mcp add df_mcp/);
+});
+
+test('blank manual selection cancels without configuration or validation', async (t) => {
+  const f = fixture(t);
+  const result = await runConfigure(['--state-dir', f.state], runtime(f, { interactive: true, ask: async () => '', validateRoot: () => assert.fail('must not validate') }));
+  assert.equal(result.cancelled, true); assert.equal(existsSync(f.state), false);
+});
+
+test('Windows picker cancellation does not fall back to another folder', async (t) => {
+  const f = fixture(t);
+  const result = await runConfigure(['--state-dir', f.state], runtime(f, { interactive: true, platform: 'win32', pickFolder: () => ({ cancelled: true }), ask: () => assert.fail('must not prompt') }));
+  assert.equal(result.cancelled, true); assert.equal(existsSync(f.state), false);
+});
+
+test('Windows picker unavailable allows manual Unicode path and still requires confirmation', async (t) => {
+  const f = fixture(t); const answers = [f.source, 'y'];
+  const result = await runConfigure(['--state-dir', f.state], runtime(f, { interactive: true, platform: 'win32', pickFolder: () => ({ unavailable: true }), ask: async () => answers.shift() }));
+  assert.equal(result.plan.root, f.source); assert.equal(answers.length, 0);
+});
+
+test('declining confirmation and failed security validation write no state', async (t) => {
+  const f = fixture(t);
+  const cancelled = await runConfigure(['--root', f.source, '--state-dir', f.state], runtime(f, { interactive: true, ask: async () => 'n' }));
+  assert.equal(cancelled.cancelled, true); assert.equal(existsSync(f.state), false);
+  await assert.rejects(runConfigure(args(f), runtime(f, { validateRoot: () => { throw new Error('UNSAFE_ROOT'); } })), /UNSAFE_ROOT/);
+  assert.equal(existsSync(f.state), false);
+});
+
+test('non-interactive configuration cannot silently select or confirm a source', async (t) => {
+  const f = fixture(t);
+  await assert.rejects(runConfigure([], runtime(f)), /requires --root/);
+  await assert.rejects(runConfigure(['--root', f.source], runtime(f)), /requires --yes/);
+  assert.throws(() => parseArguments(['--yes']), /explicit --root/);
+  assert.equal(existsSync(f.state), false);
+});
+
+test('source must not contain installation or overlap state in either direction', (t) => {
+  const f = fixture(t);
+  assert.throws(() => makePlan(f.base, f.state, { repo: f.repo }), /installation/);
+  const inside = join(f.repo, 'documents'); mkdirSync(inside);
+  assert.throws(() => makePlan(inside, f.state, { repo: f.repo }), /installation must not overlap/);
+  assert.throws(() => makePlan(f.source, join(f.source, 'cache'), { repo: f.repo }), /non-overlapping/);
+  assert.throws(() => makePlan(f.source, f.base, { repo: f.repo }), /non-overlapping/);
+  assert.throws(() => makePlan(f.source, join(f.repo, 'cache'), { repo: f.repo }), /installation must not overlap/);
+  assert.equal(existsSync(f.state), false);
+});
+
+test('linked source and linked state paths are rejected', (t) => {
+  const f = fixture(t); const linked = join(f.base, 'linked');
+  try { symlinkSync(f.source, linked, process.platform === 'win32' ? 'junction' : 'dir'); } catch (error) { if (error.code === 'EPERM') { t.skip('Symlink privilege unavailable'); return; } throw error; }
+  assert.throws(() => makePlan(linked, f.state, { repo: f.repo }), /ordinary local directory/);
+  assert.throws(() => makePlan(f.source, join(linked, 'cache'), { repo: f.repo }), /symbolic links or junctions/);
+});
+
+test('identical profile is reusable and conflicting configuration is never overwritten', async (t) => {
+  const f = fixture(t); const first = await runConfigure(args(f), runtime(f));
+  assert.equal((await runConfigure(args(f), runtime(f))).reused, true);
+  const changed = { ...first.config, poll_seconds: 60 };
+  const previous = `${JSON.stringify(changed)}\n`; writeFileSync(first.plan.configPath, previous);
+  await assert.rejects(runConfigure(args(f), runtime(f)), /different configuration/);
+  assert.equal(readFileSync(first.plan.configPath, 'utf8'), previous);
+});
+
+test('changing folders produces a distinct profile without replacing an earlier one', async (t) => {
+  const f = fixture(t); const first = await runConfigure(args(f), runtime(f));
+  const other = join(f.base, 'other source'); mkdirSync(other);
+  const second = await runConfigure(['--root', other, '--state-dir', f.state, '--yes'], runtime(f));
+  assert.notEqual(first.plan.configPath, second.plan.configPath);
+  assert.equal(JSON.parse(readFileSync(first.plan.configPath)).root, f.source);
+});
+
+test('read-only source remains usable without test writes or permission changes', async (t) => {
+  const f = fixture(t); const file = join(f.source, '预算.txt');
+  chmodSync(file, 0o444); if (process.platform !== 'win32') chmodSync(f.source, 0o555);
+  t.after(() => { try { chmodSync(file, 0o600); } catch {} });
+  const before = readFileSync(file);
+  await runConfigure(args(f), runtime(f));
+  assert.deepEqual(readFileSync(file), before);
+});
+
+test('source security validation repeats after confirmation before any configuration is written', async (t) => {
+  const f = fixture(t); let checks = 0;
+  await assert.rejects(runConfigure(args(f), runtime(f, { validateRoot: () => { if (++checks === 2) throw new Error('SOURCE_ROOT_CHANGED'); } })), /SOURCE_ROOT_CHANGED/);
+  assert.equal(checks, 2); assert.equal(existsSync(f.state), false);
+});
+
+test('arguments distinguish setup build-only from configuration, rejecting ambiguous flags', () => {
+  assert.equal(parseArguments(['--skip-config'], { allowSkip: true })['--skip-config'], true);
+  assert.throws(() => parseArguments(['--skip-config']), /Unknown argument/);
+  assert.throws(() => parseArguments(['--skip-config', '--root', 'source'], { allowSkip: true }), /cannot be combined/);
+  assert.throws(() => parseArguments(['--root']), /exactly one value/);
+  assert.throws(() => parseArguments(['--root', 'a', '--root', 'b']), /exactly one value/);
+  assert.throws(() => parseArguments(['--force']), /Unknown argument/);
+});
+
+test('platform state defaults and shell quoting preserve literal paths', () => {
+  const home = process.platform === 'win32' ? 'C:\\Example Home' : '/example-home';
+  assert.equal(defaultStateBase({ platform: 'darwin', env: {}, home }), join(home, 'Library', 'Application Support', 'df-mcp'));
+  assert.equal(defaultStateBase({ platform: 'linux', env: {}, home }), join(home, '.local', 'state', 'df-mcp'));
+  assert.throws(() => defaultStateBase({ platform: 'win32', env: {}, home }), /LOCALAPPDATA/);
+  assert.equal(shellQuote("D:\\资料 O'Brien $x", 'win32'), "'D:\\资料 O''Brien $x'");
+  assert.equal(shellQuote("a'b", 'linux'), "'a'\\''b'");
+});
+
+test('Windows Python discovery uses py -3, skips Store aliases, and never uses shell concatenation', (t) => {
+  const f = fixture(t); const tools = join(f.base, 'tools'); const store = join(f.base, 'WindowsApps'); mkdirSync(tools); mkdirSync(store);
+  writeFileSync(join(tools, 'py.exe'), ''); writeFileSync(join(store, 'python.exe'), '');
+  const calls = [];
+  const python = discoverPython({ platform: 'win32', env: { PATH: `${store};${tools}` }, runner: (command, argv, options) => { calls.push({ command, argv, options }); return { status: 0 }; } });
+  assert.equal(python.command, join(tools, 'py.exe')); assert.deepEqual(python.args, ['-3']);
+  assert.equal(calls[0].argv[0], '-3'); assert.equal(calls[0].options.shell, undefined);
+  assert.equal(calls[0].options.env.PYTHONUTF8, '1');
+});
+
+test('Windows folder picker uses a fixed command, disables new folders, and preserves Unicode', (t) => {
+  const f = fixture(t); writeFileSync(join(f.repo, 'powershell.exe'), '');
+  const selected = windowsFolderPicker({ env: { PATH: f.repo }, runner: (command, argv, options) => {
+    assert.equal(command, join(f.repo, 'powershell.exe')); assert.equal(options.shell, undefined);
+    assert.match(argv.at(-1), /ShowNewFolderButton = \$false/);
+    return { status: 0, stdout: JSON.stringify({ selected: f.source }) };
+  } });
+  assert.equal(selected.selected, f.source);
+});
+
+test('skill installs under df-mcp and existing target requires explicit replacement', (t) => {
+  const f = fixture(t); fakeSkill(f.repo); const home = join(f.base, 'codex');
+  const first = installSkill([], { repo: f.repo, codexHome: home, log: () => {} });
+  assert.equal(first.target, join(home, 'skills', 'df-mcp'));
+  writeFileSync(join(first.target, 'personal-note.md'), 'local customization');
+  assert.throws(() => installSkill([], { repo: f.repo, codexHome: home, log: () => {} }), /Nothing was changed/);
+  assert.equal(readFileSync(join(first.target, 'personal-note.md'), 'utf8'), 'local customization');
+});
+
+test('explicit skill migration backs up both names outside the skills directory', (t) => {
+  const f = fixture(t); fakeSkill(f.repo); const home = join(f.base, 'codex');
+  for (const name of ['team-drive-read', 'df-mcp']) { mkdirSync(join(home, 'skills', name), { recursive: true }); writeFileSync(join(home, 'skills', name, 'custom.md'), `custom ${name}`); }
+  assert.throws(() => installSkill([], { repo: f.repo, codexHome: home, log: () => {} }), /--replace/);
+  const result = installSkill(['--replace'], { repo: f.repo, codexHome: home, log: () => {} });
+  assert.equal(result.backups.length, 2);
+  assert.equal(existsSync(join(home, 'skills', 'team-drive-read')), false);
+  for (const backup of result.backups) { assert.ok(relative(join(home, 'skills'), backup).startsWith('..')); assert.match(readFileSync(join(backup, 'custom.md'), 'utf8'), /^custom /); }
+  assert.ok(existsSync(join(home, 'skills', 'df-mcp', 'SKILL.md')));
+});
+
+
+test('real Python preflight verifies a selected local folder without indexing or source writes', async (t) => {
+  const f = fixture(t); const original = readFileSync(join(f.source, '预算.txt'));
+  const result = await runConfigure(args(f), runtime(f, { repo: repositoryRoot, validateRoot: preflightRoot }));
+  assert.equal(existsSync(result.plan.state), false);
+  assert.deepEqual(readFileSync(join(f.source, '预算.txt')), original);
+});
