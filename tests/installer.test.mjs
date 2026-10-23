@@ -43,7 +43,7 @@ test('explicit source with Chinese/spaces creates only private configuration, ne
 
 test('blank manual selection cancels without configuration or validation', async (t) => {
   const f = fixture(t);
-  const result = await runConfigure(['--state-dir', f.state], runtime(f, { interactive: true, ask: async () => '', validateRoot: () => assert.fail('must not validate') }));
+  const result = await runConfigure(['--state-dir', f.state], runtime(f, { interactive: true, pickFolder: () => ({ unavailable: true }), ask: async () => '', validateRoot: () => assert.fail('must not validate') }));
   assert.equal(result.cancelled, true); assert.equal(existsSync(f.state), false);
 });
 

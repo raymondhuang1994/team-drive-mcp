@@ -13,7 +13,7 @@
     "setup": "node scripts/setup.mjs",
     "configure": "node scripts/configure.mjs",
     "test": "node scripts/test.mjs",
-    "test:installer": "node --test tests/installer.test.mjs",
+    "test:installer": "node --test --test-timeout=60000 tests/installer.test.mjs",
     "test:mcp": "node scripts/mcp-smoke.mjs",
     "check:public": "node scripts/check-public.mjs",
     "install:skill": "node scripts/install-skill.mjs"
