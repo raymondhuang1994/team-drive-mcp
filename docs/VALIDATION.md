@@ -1,6 +1,6 @@
 # 验证记录
 
-## 0.2：Windows、目录选择与 df mcp 改名
+## 0.2：Windows / macOS、目录选择与 df mcp 改名
 
 本节对应 0.2 更新；下方 0.1 的测试数量、独立 AI 评估与性能值是历史记录，不能当作本次 Windows 实测结果。
 
@@ -8,14 +8,24 @@
 
 | 验证项 | 本次状态 | 证据入口 |
 |---|---|---|
-| 本地构建、程序与 MCP 集成 | 待最终代码验证后记录 | `npm run build`、`npm test`、`npm run test:mcp` |
-| 安装选择/取消/明确 root/配置重叠 | 待最终安装测试后记录 | `npm run test:installer` 与 CI |
-| Windows 中文与空格路径、只读与链接边界 | 待 Windows 运行器验证后记录 | Windows CI |
-| macOS / Linux 回归 | 待各平台运行器验证后记录 | macOS / Linux CI |
+| 本地构建、程序与 MCP 集成 | 通过；本地 macOS / Python 3.9.6 的 62 项测试中 58 项通过、4 项 Windows 专项跳过，真实 stdio 的 9 个工具通过 | `npm run build`、`npm test`、`npm run test:mcp` |
+| 安装选择/取消/明确 root/配置重叠 | 三平台各 19/19 通过 | `npm run test:installer` 与 CI |
+| Windows 中文与空格路径、只读与链接边界 | 通过，含普通 8.3 短名、禁止写/删的临时 ACL、junction 拒绝、源目录固定与源内容不变检查 | 下方 Windows CI |
+| macOS / Linux 回归 | 两平台程序、安装与 MCP 集成均通过 | 下方 CI 矩阵 |
 | Skill 命名、元数据、引用 | 官方 quick_validate 通过；本地 Markdown 链接已核对，UI 提示明确使用 `$df-mcp` | `skills/df-mcp/` |
-| 公开内容检查 | 待最终发布内容扫描后记录 | `npm run check:public` |
+| 公开内容检查 | 三平台通过，扫描 50 个跟踪文本文件；仅发布通用代码与合成样本 | `npm run check:public` |
 
-目标测试矩阵为 Windows / Ubuntu / macOS、Node.js 22 与 Python 3.11。Windows GitHub 运行器不是每一版 Windows 10/11 公司的管理环境；即使 CI 通过，也需在目标电脑用获准样本做验收。未重新运行本次大规模性能基准，不将下列历史 macOS 数值外推到 Windows。
+2026-10-23 的[三平台完整 CI 记录](https://github.com/raymondhuang1994/team-drive-mcp/actions/runs/39938477725)对应实现提交 `a39d56b`。全部使用 Node.js 22，并将所选 Python 明确传入安装步骤，避免 Windows `py -3` 选中其他已安装版本：
+
+| 实际运行器 | Python | 程序测试，共 62 项 | 安装测试 | 真实 MCP 集成 |
+|---|---|---|---|---|
+| Windows Server 2025，10.0.26100 | 3.11.9 | 56 通过，6 项 POSIX 专项跳过 | 19/19 | 通过，9 工具 |
+| macOS 26.6.2，arm64 | 3.11.9 | 58 通过，4 项 Windows 专项跳过 | 19/19 | 通过，9 工具 |
+| Ubuntu 26.04.1 | 3.11.17 | 57 通过，4 项 Windows 专项与 1 项不区分大小写卷测试跳过 | 19/19 | 通过，9 工具 |
+
+62 项包括 25 项引擎、23 项解析、14 项只读边界测试。新增覆盖还包括 CRLF 原文和行号保真、Excel 临时 SQLite 在完成/取消/超限/错误时关闭，以及导出或数据库路径被替换时不能写入源目录。Windows ACL 测试只修改可丢弃的模拟目录，并先证明可读、不可追加/新建/删除/改名，再运行全部工具；正式安装不改用户 ACL。
+
+Windows GitHub 运行器不是每一版 Windows 10/11 公司的管理环境；目标电脑仍需用获准样本做验收。文件夹选择窗口采用无界面测试验证调用参数和选择/取消分支，未在 CI 中手动点击真实弹窗。未重新运行本次大规模性能基准，不将下列历史 macOS 数值外推到 Windows。
 
 0.2 同时调整为单个持久 SQLite 连接、`RLock` 及 `journal_mode=MEMORY`，不生成 WAL/SHM/磁盘回滚日志旁文件，并以受控文件描述符创建和核验数据库。索引属于可重建缓存；异常退出或断电可能需要新状态重建。0.1 旧 WAL/根绑定不直接迁移，应使用新的 `--state-dir` 基目录配置；演示已切换 `.local/sample-v02-state/`。这些存储变化的验证需以本次测试为准，不能沿用下面的 0.1 性能与恢复结论。
 
