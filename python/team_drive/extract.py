@@ -15,6 +15,7 @@ import sqlite3
 import sys
 import tempfile
 import zipfile
+from contextlib import closing
 from pathlib import Path
 from typing import Any, Dict, Iterator
 
@@ -154,17 +155,24 @@ def _lines(path, limits):
     cap = limits["max_segment_chars"]
     with path.open("r", encoding="utf-8-sig", newline="") as handle:
         line, part = 1, 1
+        previous_cr = False
         while True:
             # readline(size) also bounds single exceptionally long lines.
             text = handle.readline(cap)
             if not text:
                 break
+            # A size boundary can split CRLF. Keep its LF on the same source
+            # line; a bare CR starts the next line before its following text.
+            if previous_cr and not text.startswith("\n"):
+                line += 1
+                part = 1
             yield _segment({"kind": "line", "line_start": line, "line_end": line, "part": part}, text)
-            if text.endswith("\n") or text.endswith("\r"):
+            if text.endswith("\n"):
                 line += 1
                 part = 1
             else:
                 part += 1
+            previous_cr = text.endswith("\r")
 
 
 def _column(index):
@@ -254,7 +262,9 @@ def _xlsx(path, limits):
     with _Archive(path, limits) as arc, tempfile.TemporaryDirectory(prefix="team-drive-strings-") as temp:
         # A disk-backed shared-string lookup avoids a Python list proportional to
         # every string in a large workbook. Temporary data is deleted on exit.
-        with sqlite3.connect(str(Path(temp) / "strings.sqlite")) as strings:
+        # sqlite3's connection context manages transactions, not the connection
+        # lifetime. Close before TemporaryDirectory cleanup (required on Windows).
+        with closing(sqlite3.connect(str(Path(temp) / "strings.sqlite"))) as strings, strings:
             strings.execute("CREATE TABLE strings (id INTEGER PRIMARY KEY, text TEXT NOT NULL)")
             if "xl/sharedStrings.xml" in arc.names:
                 counter = 0
@@ -558,10 +568,11 @@ def iter_segments(path: Path, limits: Dict[str, Any]) -> Iterator[Dict[str, Any]
             raise ExtractionError("limit_exceeded", "File exceeds the configured byte limit.")
         parser = {".txt": _lines, ".md": _lines, ".csv": _csv, ".tsv": _csv,
                   ".xlsx": _xlsx, ".docx": _docx, ".pptx": _pptx, ".pdf": _pdf}[path.suffix.lower()]
-        for count, segment in enumerate(parser(path, config), 1):
-            if count > config["max_segments"]:
-                raise ExtractionError("limit_exceeded", "Extraction exceeds the configured segment limit; results are partial.")
-            yield segment
+        with closing(parser(path, config)) as segments:
+            for count, segment in enumerate(segments, 1):
+                if count > config["max_segments"]:
+                    raise ExtractionError("limit_exceeded", "Extraction exceeds the configured segment limit; results are partial.")
+                yield segment
     except ExtractionError:
         raise
     except UnicodeDecodeError:

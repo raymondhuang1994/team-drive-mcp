@@ -21,10 +21,13 @@ jobs:
           node-version: '22'
           cache: npm
       - uses: actions/setup-python@v7
+        id: python
         with:
           python-version: '3.11'
       - run: npm ci --ignore-scripts
       - run: npm run setup -- --skip-config
+        env:
+          DF_MCP_PYTHON: ${{ steps.python.outputs.python-path }}
       - run: npm run test:installer
       - run: npm test
       - run: npm run test:mcp

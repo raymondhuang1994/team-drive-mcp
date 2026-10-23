@@ -224,6 +224,25 @@ class ReadOnlyTests(unittest.TestCase):
             self.start()
         self.assertEqual(before, self.snapshot())
 
+    @unittest.skipUnless(os.name == "nt", "Windows ordinary 8.3 aliases")
+    def test_windows_short_path_alias_for_unicode_root_remains_readonly(self):
+        import ctypes
+        from ctypes import wintypes
+        kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+        short_path = kernel.GetShortPathNameW
+        short_path.argtypes = [wintypes.LPCWSTR, wintypes.LPWSTR, wintypes.DWORD]
+        short_path.restype = wintypes.DWORD
+        size = short_path(str(self.root), None, 0)
+        self.assertGreater(size, 0)
+        buffer = ctypes.create_unicode_buffer(size + 1)
+        copied = short_path(str(self.root), buffer, len(buffer))
+        self.assertGreater(copied, 0)
+        self.assertLess(copied, len(buffer))
+        alias = Path(buffer.value)
+        self.assertTrue(os.path.samefile(alias, self.root))
+        self.config.write_text(json.dumps({"root": str(alias), "state_dir": str(self.state)}), encoding="utf-8")
+        self.exercise_all_tools()
+
     @unittest.skipUnless(os.name == "nt", "Windows directory handles pin roots")
     def test_windows_root_cannot_be_rebound_while_service_active(self):
         engine = self.start()

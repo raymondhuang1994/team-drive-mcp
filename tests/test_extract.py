@@ -1,12 +1,14 @@
 """Generated public fixtures exercise parsing boundaries and evidence fidelity."""
 import json
 import os
+import sqlite3
 import subprocess
 import sys
 import tempfile
 import unittest
 import zipfile
 from pathlib import Path
+from unittest import mock
 
 from team_drive.extract import ExtractionError, _cell_text, iter_segments
 
@@ -29,7 +31,9 @@ class ExtractTests(unittest.TestCase):
 
     def file(self, name, text):
         path = self.root / name
-        path.write_text(text, encoding="utf-8")
+        # Fixtures must have identical bytes on Windows and POSIX. Text-mode
+        # writes translate LF to CRLF on Windows and obscure fidelity assertions.
+        path.write_bytes(text.encode("utf-8"))
         return path
 
     def archive(self, name, members):
@@ -69,6 +73,25 @@ class ExtractTests(unittest.TestCase):
         self.assertEqual(2, len(segments))
         self.assertEqual(2, segments[1]["locator"]["row"])
         self.assertEqual("Two\nlines", segments[1]["data"]["cells"][0]["value"])
+        self.assertEqual(3, segments[1]["data"]["physical_line_end"])
+
+    def test_crlf_source_text_and_csv_quoted_newlines_are_preserved(self):
+        original = "预算\r\nnext\r\n"
+        path = self.file("windows.txt", original)
+        source_lines = [1] * len("预算\r\n") + [2] * len("next\r\n")
+        for cap in (1, 3, 8_000):
+            with self.subTest(max_segment_chars=cap):
+                segments = list(iter_segments(path, {"max_segment_chars": cap}))
+                self.assertEqual(original, "".join(s["text"] for s in segments))
+                offset = 0
+                for segment in segments:
+                    self.assertEqual(source_lines[offset], segment["locator"]["line_start"])
+                    offset += len(segment["text"])
+        bare_cr = list(iter_segments(self.file("legacy.txt", "first\rsecond\r"), {}))
+        self.assertEqual([1, 2], [s["locator"]["line_start"] for s in bare_cr])
+        path = self.file("windows.csv", 'name,amount\r\n"Two\r\nlines",10.25\r\n')
+        segments = list(iter_segments(path, {}))
+        self.assertEqual("Two\r\nlines", segments[1]["data"]["cells"][0]["value"])
         self.assertEqual(3, segments[1]["data"]["physical_line_end"])
 
     def test_csv_long_cell_split_preserves_all_characters(self):
@@ -162,6 +185,41 @@ class ExtractTests(unittest.TestCase):
     def test_xlsx_without_sheet_declarations_fails(self):
         path = self.archive("nosheets.xlsx", {"xl/workbook.xml": f'<workbook xmlns="{S}"><sheets/></workbook>'})
         self.assertCode("unsupported_structure", path)
+
+    def test_xlsx_temporary_database_is_closed_and_removed_on_every_exit(self):
+        connect = sqlite3.connect
+        for outcome in ("complete", "cancel", "limit", "parse_error"):
+            with self.subTest(outcome=outcome):
+                connections = []
+                databases = []
+
+                def capture_connection(filename, *args, **kwargs):
+                    connection = connect(filename, *args, **kwargs)
+                    connections.append(connection)
+                    databases.append(Path(filename))
+                    return connection
+
+                rows = '<row r="1"><c r="A1"><v>1</v></c></row><row r="2"><c r="A2"><v>2</v></c></row>'
+                if outcome == "parse_error":
+                    rows = '<row r="1"><c r="A2"><v>1</v></c></row>'
+                path = self.xlsx(rows)
+                with mock.patch("team_drive.extract.sqlite3.connect", side_effect=capture_connection):
+                    iterator = iter_segments(path, {"max_segments": 1} if outcome == "limit" else {})
+                    if outcome == "complete":
+                        self.assertEqual(2, len(list(iterator)))
+                    elif outcome == "cancel":
+                        next(iterator)
+                        iterator.close()
+                    else:
+                        with self.assertRaises(ExtractionError) as caught:
+                            list(iterator)
+                        self.assertEqual("limit_exceeded" if outcome == "limit" else "parse_failed",
+                                         caught.exception.code)
+                self.assertEqual(1, len(connections))
+                for connection, database in zip(connections, databases):
+                    with self.assertRaises(sqlite3.ProgrammingError):
+                        connection.execute("SELECT 1")
+                    self.assertFalse(database.parent.exists())
 
     def test_zip_bomb_budget_and_traversal_are_rejected(self):
         path = self.archive("large.docx", {"word/document.xml": "a" * 4096})

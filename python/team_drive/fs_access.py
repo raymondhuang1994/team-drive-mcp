@@ -228,6 +228,8 @@ if os.name == "nt":
     _kernel.GetFileInformationByHandle.restype = wintypes.BOOL
     _kernel.GetFinalPathNameByHandleW.argtypes = [wintypes.HANDLE, wintypes.LPWSTR, wintypes.DWORD, wintypes.DWORD]
     _kernel.GetFinalPathNameByHandleW.restype = wintypes.DWORD
+    _kernel.GetLongPathNameW.argtypes = [wintypes.LPCWSTR, wintypes.LPWSTR, wintypes.DWORD]
+    _kernel.GetLongPathNameW.restype = wintypes.DWORD
     _kernel.GetDriveTypeW.argtypes = [wintypes.LPCWSTR]
     _kernel.GetDriveTypeW.restype = wintypes.UINT
     class _AttributeTagInfo(ctypes.Structure):
@@ -273,6 +275,22 @@ if os.name == "nt":
         if not copied or copied >= len(buffer):
             raise OSError("Cannot resolve an opened file.")
         return _canonical(buffer.value)
+
+    def _long_path(path):
+        """Expand 8.3 names only after this component and all parents are pinned.
+
+        This is not a substitute for reparse checks: callers first open every
+        directory with OPEN_REPARSE_POINT and reject its reparse attributes.
+        """
+        required = _kernel.GetLongPathNameW(_extended(path), None, 0)
+        if not required:
+            raise OSError("Cannot expand the approved directory name.")
+        buffer = ctypes.create_unicode_buffer(required + 1)
+        copied = _kernel.GetLongPathNameW(_extended(path), buffer, len(buffer))
+        if not copied or copied >= len(buffer):
+            raise OSError("Cannot expand the approved directory name.")
+        value = buffer.value
+        return value[4:] if value.startswith("\\\\?\\") else value
 
     def _handle(path, directory=False, write=False, create=False, exclusive=False):
         access = _READ | (_WRITE if write else 0)
@@ -320,9 +338,15 @@ if os.name == "nt":
                     handle = _handle(current, directory=True)
                     self.handles.append(handle)
                     info = _file_info(handle)
-                    if not stat.S_ISDIR(info.st_mode) or info.st_file_attributes & _REPARSE or _final_path(handle) != _canonical(current):
-                        raise DriveError(code, "Directory links, junctions, reparse points, and redirected paths are forbidden.")
+                    if not stat.S_ISDIR(info.st_mode) or info.st_file_attributes & _REPARSE:
+                        raise DriveError(code, "Directory links, junctions, and reparse points are forbidden.")
+                    # TEMP commonly contains a normal 8.3 account-directory
+                    # alias. Expand it only once its no-reparse identity is pinned.
+                    current = Path(_long_path(current))
+                    if _final_path(handle) != _canonical(current):
+                        raise DriveError(code, "The opened directory resolves to an unexpected location.")
                     self.identities.append((current, info.st_dev, info.st_ino))
+                self.path = current
             except Exception as exc:
                 self.close()
                 if isinstance(exc, DriveError):
@@ -442,6 +466,7 @@ class StateAccess:
             raise DriveError("UNSAFE_STATE", "The state directory cannot contain the installed application.")
         if os.name == "nt":
             self.guard = _WindowsDirectories(self.path, create=True, code="UNSAFE_STATE")
+            self.path = self.guard.path
             self.identity = self.guard.identities[-1][1:]
         else:
             self.fd = _make_posix_state(self.path, source.identity)
