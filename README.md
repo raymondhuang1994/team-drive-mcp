@@ -9,6 +9,7 @@
 - [验证记录与限制](docs/VALIDATION.md)
 - [Windows 只读边界与可选隔离部署](docs/WINDOWS_READ_ONLY.md)
 - [Windows 临时修复迁移与并发验收](docs/WINDOWS_MIGRATION.md)
+- [Windows 旧临时补丁：重新安装步骤](docs/WINDOWS_REINSTALL.md)
 - [10 个固定评估任务](tests/evaluation.xml)
 
 ## 已实现的范围
@@ -27,6 +28,8 @@
 **当前未实现：** SharePoint 登录与下载、多用户身份权限、OCR、向量检索、原始文件下载工具、模型自我训练、无人值守云端部署。没有真实团队资料，也没有公司 PPT 模板。
 
 ## 安装：先选择允许读取的文件夹
+
+Windows 已用过临时 launcher 或修改过 `dist/index.js`，准备卸载重装时，请按[重新安装步骤](docs/WINDOWS_REINSTALL.md)处理旧注册、解释器和状态目录。无需卸载 Codex，也不要删除整个 `.codex` 或源资料；仅重新下载程序不能清除旧连接配置。
 
 把仓库与真实资料放在**互不包含的独立目录**，不要将运行安装放在会被定期清除的下载缓存或临时目录中。安装 Node.js 22+ 和 Python 3.9+，下载本仓库或执行下面的 clone 命令。Windows PowerShell、macOS 或 Linux 终端均可执行：
 

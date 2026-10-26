@@ -1,5 +1,7 @@
 # Windows 临时修复迁移与并发验收
 
+准备移除临时补丁后重新安装的用户，可先按[Windows 重新安装步骤](WINDOWS_REINSTALL.md)操作；本页提供详细迁移检查、恢复策略和实机验收。无需卸载 Codex 或删除整个 `.codex`。
+
 此修复修改 MCP 服务的状态目录检查、worker 连接和共享索引管理。更新 Skill 不会改变 Windows 目录句柄或 SQLite 的行为。0.3 使用一个按需启动的本地 broker 管理索引，多个 stdio 桥接客户端通过 Windows named pipe 共享同一引擎；不安装系统服务，也不让多个 worker 直接写同一个数据库。
 
 **验证边界：**开发机为 macOS，无法读取目标 Windows 电脑中的临时 launcher、Codex 配置、修改后的 `dist/index.js` 或旁边的备份。本说明是迁移和验收步骤，不表示这些 Windows 文件已经检查、替换或通过实测。用户报告的“两份独立 MCP 客户端状态正常、`.codex` 原子重命名成功”属于临时修复结果，不能替代下方实际 Codex 多聊天验收。
