@@ -28,11 +28,26 @@ def _live_fds():
     for value in os.listdir("/dev/fd"):
         if value.isdigit():
             try:
-                os.fstat(int(value))
-                result.add(value)
+                info = os.fstat(int(value))
+                # A concurrent reader may close its descriptor and SQLite may
+                # reuse that number. Include identity, not just the fd number.
+                result.add((value, info.st_dev, info.st_ino))
             except OSError:
                 pass
     return result
+
+
+def _state_open(*args, **kwargs):
+    # SQLite descriptor verification examines process-wide new writable fds.
+    # Serialize only their creation, never the potentially long file I/O, so a
+    # concurrent export cannot be mistaken for a redirected database handle.
+    with _DB_OPEN_LOCK:
+        return os.open(*args, **kwargs)
+
+
+def _state_dup(fd):
+    with _DB_OPEN_LOCK:
+        return os.dup(fd)
 
 
 def online_only(info):
@@ -307,7 +322,9 @@ if os.name == "nt":
         _fields_ = [("status", ctypes.c_void_p), ("information", ctypes.c_size_t)]
 
     class _RenameInformation(ctypes.Structure):
-        _fields_ = [("replace", ctypes.c_ubyte), ("root", wintypes.HANDLE),
+        # The native union holds BOOLEAN ReplaceIfExists for class 10 and
+        # ULONG Flags for class 65. The DWORD form preserves both ABI layouts.
+        _fields_ = [("flags", wintypes.DWORD), ("root", wintypes.HANDLE),
                     ("length", wintypes.DWORD), ("name", wintypes.WCHAR * 1)]
 
     _ntdll.NtSetInformationFile.argtypes = [wintypes.HANDLE, ctypes.POINTER(_IoStatusBlock),
@@ -397,12 +414,21 @@ if os.name == "nt":
         size = _RenameInformation.name.offset + len(encoded)
         buffer = ctypes.create_string_buffer(max(size, ctypes.sizeof(_RenameInformation)))
         info = _RenameInformation.from_buffer(buffer)
-        info.replace = 1
+        # POSIX replacement keeps existing metadata readers on the old complete
+        # file while new readers open the new complete file. This opt-in applies
+        # only to guarded private state publication, never source handles.
+        info.flags = 0x1 | 0x2  # REPLACE_IF_EXISTS | POSIX_SEMANTICS
         info.root = None
         info.length = len(encoded)
         ctypes.memmove(ctypes.addressof(buffer) + _RenameInformation.name.offset, encoded, len(encoded))
         result = _IoStatusBlock()
-        status = _ntdll.NtSetInformationFile(handle, ctypes.byref(result), buffer, size, 10)
+        status = _ntdll.NtSetInformationFile(handle, ctypes.byref(result), buffer, size, 65)
+        if status < 0 and _ntdll.RtlNtStatusToDosError(status) in (1, 50, 87, 124):
+            # Older local filesystems may lack the extended information class.
+            # Keep the safe classic behavior there; do not retry access-denied
+            # or sharing failures, and never loosen directory/source guards.
+            info.flags = 1
+            status = _ntdll.NtSetInformationFile(handle, ctypes.byref(result), buffer, size, 10)
         if status < 0:
             raise ctypes.WinError(_ntdll.RtlNtStatusToDosError(status))
 
@@ -640,7 +666,7 @@ class StateAccess:
             # directory and retry only that error, never links or permission errors.
             for attempt in range(3):
                 try:
-                    self.lock_fd = os.open(".worker.lock", os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600, dir_fd=self.fd)
+                    self.lock_fd = _state_open(".worker.lock", os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600, dir_fd=self.fd)
                     break
                 except FileNotFoundError:
                     self.check()
@@ -736,7 +762,7 @@ class StateAccess:
                     flags |= os.O_CREAT
                 if exclusive:
                     flags |= os.O_EXCL
-                fd = os.open(name, flags, 0o600, dir_fd=self.fd)
+                fd = _state_open(name, flags, 0o600, dir_fd=self.fd)
                 info = os.fstat(fd)
             if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
                 raise DriveError("UNSAFE_STATE", "Private state files must be ordinary files with one hard link.")
@@ -778,6 +804,8 @@ class StateAccess:
                     raise DriveError("UNSAFE_STATE", "The private publication source has been redirected.")
                 # Writers already fsync and close staging data before publishing.
                 # Keep this verified source handle open through the atomic rename.
+                # This is process-crash recovery, not a verified power-loss
+                # guarantee or a claim of MOVEFILE_WRITE_THROUGH equivalence.
                 _rename_same_directory(handle, destination_name)
                 if _final_path(handle) != _canonical(self.path / destination_name):
                     raise DriveError("STATE_CHANGED", "The published state file resolved outside its expected name.")
@@ -878,7 +906,7 @@ class StateAccess:
         expected = os.fstat(fd)
         connection = None
         try:
-            with os.fdopen(os.dup(fd), "rb") as header_file:
+            with os.fdopen(_state_dup(fd), "rb") as header_file:
                 header = header_file.read(20)
             if len(header) >= 20 and header[:16] == b"SQLite format 3\0" and (header[18] == 2 or header[19] == 2):
                 raise DriveError("STATE_REBUILD_REQUIRED", "Legacy WAL format requires explicit maintenance before migration.")
@@ -888,7 +916,7 @@ class StateAccess:
                 if os.name == "posix":
                     import fcntl
                     verified = False
-                    for value in _live_fds() - before_fds:
+                    for value, _, _ in _live_fds() - before_fds:
                         try:
                             opened = os.fstat(int(value))
                             writable = fcntl.fcntl(int(value), fcntl.F_GETFL) & os.O_ACCMODE != os.O_RDONLY
@@ -923,7 +951,7 @@ class StateAccess:
         target_fd = None
         try:
             target_fd = self._open_root("index.working.sqlite", write=True, create=True, exclusive=True)
-            with os.fdopen(os.dup(source_fd), "rb") as source, os.fdopen(os.dup(target_fd), "wb") as target:
+            with os.fdopen(_state_dup(source_fd), "rb") as source, os.fdopen(_state_dup(target_fd), "wb") as target:
                 while True:
                     chunk = source.read(1024 * 1024)
                     if not chunk:
@@ -1045,10 +1073,10 @@ class StateAccess:
             try:
                 if os.name == "nt":
                     # The directory is pinned against replacement and reparse changes.
-                    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_BINARY, 0o600)
+                    fd = _state_open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_BINARY, 0o600)
                 else:
                     parent_fd = os.open(parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=self.fd)
-                    fd = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=parent_fd)
+                    fd = _state_open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=parent_fd)
                 with os.fdopen(fd, "wb" if binary else "w", **({} if binary else {"encoding": "utf-8"})) as output:
                     fd = None
                     yield output
@@ -1086,7 +1114,7 @@ class StateAccess:
                     fd = msvcrt.open_osfhandle(handle, (os.O_RDWR if mode == "w" else os.O_RDONLY) | os.O_BINARY)
                 else:
                     parent_fd = os.open(parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=self.fd)
-                    fd = os.open(name, (os.O_RDWR if mode == "w" else os.O_RDONLY) | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent_fd)
+                    fd = _state_open(name, (os.O_RDWR if mode == "w" else os.O_RDONLY) | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent_fd)
                     info = os.fstat(fd)
                     if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
                         raise DriveError("UNSAFE_STATE", "A private parser file has been redirected.")
@@ -1150,7 +1178,10 @@ class StateAccess:
                         children = list(entries)
                     safe = True
                     for entry in children:
-                        info = entry.stat(follow_symlinks=False)
+                        # Windows DirEntry caches report nlink/ino/dev as zero.
+                        # Query the pinned-directory child for real link count;
+                        # never treat an unknown/zero count as a safe single link.
+                        info = os.stat(folder / entry.name, follow_symlinks=False)
                         recognized = re.fullmatch(r"(?:parsed-[0-9a-f]{32}\.jsonl|snapshot-[0-9a-f]{32}\.(?:txt|md|csv|tsv|xlsx|docx|pptx|pdf))", entry.name)
                         if not recognized or not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or getattr(info, "st_file_attributes", 0) & 0x400:
                             safe = False

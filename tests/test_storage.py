@@ -129,7 +129,13 @@ class StorageTests(unittest.TestCase):
         self.assertFalse((self.state / "endpoint.json.next").exists())
         self.assertIsNone(self.storage.read_metadata("absent.json"))
         self.storage.remove_metadata("endpoint.json")
+        # Create hostile pre-existing state before guards are acquired. Windows
+        # itself rejects CreateHardLink while the parent guards deny write sharing.
+        self.close()
+        self.source.close()
         os.link(self.root / "keep.txt", self.state / "endpoint.json")
+        self.source = SourceAccess(self.root)
+        self.open()
         with self.assertRaises(DriveError):
             self.storage.write_metadata("endpoint.json", {"do_not_write": True})
         self.assertTrue((self.state / "endpoint.json").exists())
@@ -168,6 +174,74 @@ class StorageTests(unittest.TestCase):
         finally:
             os.chdir(original)
 
+    @unittest.skipUnless(os.name == "posix", "POSIX descriptor verification concurrency")
+    def test_export_fd_creation_cannot_contaminate_sqlite_descriptor_verification(self):
+        self.commit_fixture()
+        with self.storage.directory("exports", create=True):
+            pass
+        at_connect = threading.Event()
+        export_attempt = threading.Event()
+        export_opened = threading.Event()
+        errors = []
+        real_connect = sqlite3.connect
+
+        def export():
+            try:
+                if not at_connect.wait(5):
+                    raise AssertionError("SQLite did not reach the guarded connect window")
+                export_attempt.set()
+                with self.storage.new_private(self.state / "exports" / "evidence.jsonl") as output:
+                    export_opened.set()
+                    output.write('{"synthetic":"evidence"}\n')
+            except Exception as exc:
+                errors.append(exc)
+
+        def connect(database, *args, **kwargs):
+            if "index.next.sqlite" in str(database):
+                at_connect.set()
+                self.assertTrue(export_attempt.wait(5))
+                self.assertFalse(export_opened.wait(0.05), "Export fd must wait until SQLite has verified its own fd")
+            return real_connect(database, *args, **kwargs)
+
+        worker = threading.Thread(target=export)
+        worker.start()
+        try:
+            with mock.patch("sqlite3.connect", connect):
+                self.storage.checkpoint_database(self.connection)
+        finally:
+            at_connect.set()
+            worker.join(5)
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(errors, [])
+        self.assertTrue(export_opened.is_set())
+        self.assertEqual((self.state / "exports" / "evidence.jsonl").read_text(), '{"synthetic":"evidence"}\n')
+
+    @unittest.skipUnless(os.name == "posix", "POSIX descriptor-number reuse")
+    def test_sqlite_can_reuse_a_concurrently_closed_reader_descriptor(self):
+        self.commit_fixture()
+        reader = os.open(self.root / "keep.txt", os.O_RDONLY)
+        closed = False
+        reused = []
+        real_connect = sqlite3.connect
+
+        def connect(database, *args, **kwargs):
+            nonlocal closed
+            if "index.next.sqlite" in str(database):
+                os.close(reader)
+                closed = True
+                connection = real_connect(database, *args, **kwargs)
+                reused.append(os.fstat(reader).st_ino == (self.state / "index.next.sqlite").stat().st_ino)
+                return connection
+            return real_connect(database, *args, **kwargs)
+
+        try:
+            with mock.patch("sqlite3.connect", connect):
+                self.storage.checkpoint_database(self.connection)
+        finally:
+            if not closed:
+                os.close(reader)
+        self.assertEqual(reused, [True], "The test must exercise SQLite reuse of the earlier reader fd number")
+
     @unittest.skipUnless(os.name == "posix", "POSIX fault injection; Windows pins SQLite files")
     def test_staging_file_swap_at_sqlite_open_cannot_write_source(self):
         self.commit_fixture()
@@ -195,11 +269,18 @@ class StorageTests(unittest.TestCase):
     def test_hardlinked_staging_or_journal_is_never_modified(self):
         self.commit_fixture()
         for name in ("index.next.sqlite", "index.working.sqlite-journal"):
+            self.close()
+            self.source.close()
             os.link(self.root / "keep.txt", self.state / name)
+            self.source = SourceAccess(self.root)
             with self.assertRaises(DriveError):
-                self.storage.checkpoint_database(self.connection)
+                self.open()
             self.assertTrue((self.state / name).exists())
+            self.close()
+            self.source.close()
             (self.state / name).unlink()
+            self.source = SourceAccess(self.root)
+            self.open()
 
     def test_sidecar_inserted_at_connect_is_rejected_before_any_pragma(self):
         self.commit_fixture()

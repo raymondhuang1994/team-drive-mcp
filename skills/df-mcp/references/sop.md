@@ -24,6 +24,8 @@ On an older service, export each source with its expected version and keep an eq
 
 Calculate with deterministic code/tools, exact decimal money arithmetic, explicit currency/rounding, agreed business filters and deduplication keys. Reconcile segment counts with actual business rows. When relevant inputs are missing or partial, resolve them or label a bounded subtotal rather than an unconditional total/ranking.
 
+For a CSV calculation, see the [simulated worked example](evidence-worked-example.md) for JSONL row reconstruction, explicit filters, Decimal arithmetic and a row-level inclusion/gap ledger; adapt its business definitions to the actual evidence.
+
 ## Answer
 
 Lead with the finding and cite exact relative file, returned locator and source version. For exhaustive work state the population, exclusions, gaps, observation window and calculation method to the extent needed for verification. Public research can supply separately sourced public facts; it cannot replace an internal approval, budget or contract term.
