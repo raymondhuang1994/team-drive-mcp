@@ -5,7 +5,8 @@ import { homedir } from 'node:os';
 import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { createInterface } from 'node:readline/promises';
 import { fileURLToPath } from 'node:url';
-import { findExecutable, requireVenv } from './installer-utils.mjs';
+import { currentNodeExecutable, findExecutable, requireVenv, venvPython } from './installer-utils.mjs';
+import { validateRuntimeOptions } from './config-validation.mjs';
 
 export const repositoryRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 export const helpText = `Configure df mcp to read one explicitly selected local folder.\n\n  --root <folder>       Source folder (read only; relative paths use the current directory)\n  --state-dir <folder>  Override the application state base; profiles are created below it\n  --yes                Confirm without a prompt; requires explicit --root\n  --help               Show this help\n\nWindows uses a folder picker when no --root is provided; other systems ask for a path.\nNo source directory is scanned and no MCP process is started by this installer.`;
@@ -135,12 +136,17 @@ export function windowsFolderPicker({ env = process.env, runner = spawnSync } = 
   try { return JSON.parse(result.stdout.trim().replace(/^\uFEFF/, '')); } catch { return { unavailable: true }; }
 }
 
+function configuredPath(value, configPath) {
+  if (typeof value !== 'string' || !value.trim()) return null;
+  const expanded = value === '~' ? homedir() : value.startsWith(`~${sep}`) ? join(homedir(), value.slice(2)) : value;
+  return resolve(dirname(configPath), expanded);
+}
+
 function sameSourceAndState(existing, plan) {
   if (!existing || typeof existing !== 'object' || Array.isArray(existing) || (existing.provider ?? 'local') !== 'local') return false;
   const expand = (value) => {
-    if (typeof value !== 'string' || !value.trim()) return null;
-    const expanded = value === '~' ? homedir() : value.startsWith(`~${sep}`) ? join(homedir(), value.slice(2)) : value;
-    return canonicalFuturePath(resolve(dirname(plan.configPath), expanded));
+    const path = configuredPath(value, plan.configPath);
+    return path === null ? null : canonicalFuturePath(path);
   };
   const root = expand(existing.root), state = expand(existing.state_dir);
   const same = (left, right) => left !== null && contained(left, right, plan.platform) && contained(right, left, plan.platform);
@@ -152,10 +158,19 @@ export function writeConfiguration(plan) {
   rejectCodexStorage(plan.profile, plan);
   rejectStorageLinks(plan.profile);
   if (existsSync(plan.configPath)) {
-    if (lstatSync(plan.configPath).isSymbolicLink()) throw new Error('Refusing to replace a linked configuration file.');
+    const info = lstatSync(plan.configPath);
+    if (info.isSymbolicLink()) throw new Error('Refusing to replace a linked configuration file.');
+    if (!info.isFile() || info.size > 262144) throw new Error('Existing configuration must be an ordinary JSON file no larger than 256 KiB. It was not changed.');
     let existing;
     try { existing = JSON.parse(readFileSync(plan.configPath, 'utf8')); } catch { throw new Error('An existing configuration cannot be read. It was not changed.'); }
     if (!sameSourceAndState(existing, plan)) throw new Error('This profile is bound to a different source or state location. Nothing was overwritten. Confirm the intended source with configure; a new source receives its own profile.');
+    const source = configuredPath(existing.root, plan.configPath);
+    if (!lstatSync(source).isDirectory() || lstatSync(source).isSymbolicLink()) throw new Error('The existing configured source must be an ordinary directory, not a linked root. Nothing was changed.');
+    if (plan.platform === 'win32') rejectStorageLinks(source);
+    const state = configuredPath(existing.state_dir, plan.configPath);
+    rejectCodexStorage(state, plan);
+    rejectStorageLinks(state);
+    validateRuntimeOptions(existing);
     // Preserve formatting, key order and all user-selected runtime options byte for byte.
     return { config: existing, reused: true };
   }
@@ -208,7 +223,7 @@ export async function runConfigure(argv = [], runtime = {}) {
     if (fresh.root !== plan.root || fresh.configPath !== plan.configPath) throw new Error('A selected path changed during configuration. Nothing was written; try again.');
     await validate(plan.sourcePath, { repo: plan.repo, platform, env: runtime.env || process.env });
     const result = writeConfiguration(plan);
-    log(`${result.reused ? 'Existing configuration reused; runtime options and formatting were preserved.' : 'Configuration saved.'} Indexing starts only when the MCP client starts the server.\nRegister in Codex (PowerShell on Windows):\ncodex mcp add df_mcp -- node ${shellQuote(join(plan.repo, 'dist', 'index.js'), platform)} --config ${shellQuote(plan.configPath, platform)}\nInstall the skill separately with: npm run install:skill\nConcurrent MCP connections share one managed local index. Restart existing chats after changing the connection configuration.`);
+    log(`${result.reused ? 'Existing configuration reused; runtime options and formatting were preserved.' : 'Configuration saved.'} Indexing starts only when the MCP client starts the server.\nRegister in Codex (PowerShell on Windows):\ncodex mcp add df_mcp -- ${shellQuote(currentNodeExecutable({ platform, env: runtime.env || process.env }), platform)} ${shellQuote(join(plan.repo, 'dist', 'index.js'), platform)} --config ${shellQuote(plan.configPath, platform)} --python ${shellQuote(venvPython(plan.repo, platform), platform)}\nThe command pins this installation's Node and Python paths, so desktop PATH differences or inherited Python overrides cannot select another runtime.\nInstall the skill separately with: npm run install:skill\nConcurrent MCP connections share one managed local index. Restart existing chats after changing the connection configuration.`);
     return { ...result, plan };
   } finally { reader?.close(); }
 }

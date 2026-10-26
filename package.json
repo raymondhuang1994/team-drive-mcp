@@ -23,7 +23,8 @@
     "test:concurrency": "node scripts/mcp-concurrency.mjs",
     "maintain:state": "node scripts/maintain-state.mjs",
     "check:public": "node scripts/check-public.mjs",
-    "install:skill": "node scripts/install-skill.mjs"
+    "install:skill": "node scripts/install-skill.mjs",
+    "test:install": "node scripts/install-smoke.mjs"
   },
   "dependencies": {
     "@modelcontextprotocol/server": "2.3.1",

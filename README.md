@@ -1,5 +1,7 @@
 # df mcp
 
+[![Windows, macOS and Linux validation](https://github.com/raymondhuang1994/team-drive-mcp/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/raymondhuang1994/team-drive-mcp/actions/workflows/ci.yml)
+
 给 AI 使用的本地团队文件读取工具，Skill 名称为 **`df-mcp`**，界面名称为 **df mcp**；GitHub 仓库仍使用 `team-drive-mcp`。架构：**Skill + MCP + SQLite 增量索引**。优先保证来源、版本和读取范围可核查，再优化定位速度。所有附带业务数据均为 **SIMULATED / 完全虚构**。
 
 - [完整中文开发方案](docs/TEAM_AGENT_DEVELOPMENT_PLAN.md)
@@ -26,9 +28,11 @@
 
 ## 安装：先选择允许读取的文件夹
 
-把仓库与真实资料放在**互不包含的独立目录**。安装 Node.js 22+ 和 Python 3.9+，进入仓库目录。在 Windows PowerShell、macOS 或 Linux 终端均可执行：
+把仓库与真实资料放在**互不包含的独立目录**，不要将运行安装放在会被定期清除的下载缓存或临时目录中。安装 Node.js 22+ 和 Python 3.9+，下载本仓库或执行下面的 clone 命令。Windows PowerShell、macOS 或 Linux 终端均可执行：
 
 ```sh
+git clone https://github.com/raymondhuang1994/team-drive-mcp.git
+cd team-drive-mcp
 npm ci --ignore-scripts
 npm run setup
 npm run install:skill
@@ -66,19 +70,36 @@ npm run configure -- --root 'D:\团队资料' --yes
 
 ## 配置 MCP 客户端
 
-Windows PowerShell，在仓库目录执行，将 `$config` 替换成向导显示的配置文件绝对路径：
+**优先直接复制配置向导输出的注册命令。** 它使用当前安装的 Node 与专用 Python 环境的绝对路径，避免桌面应用与终端的 PATH 不同、或继承了另一套 Python 环境而启动失败。以下是手动配置的同等写法；将配置路径替换成向导的实际输出。
+
+Windows PowerShell，在仓库目录执行：
 
 ```powershell
 $repo = (Get-Location).Path
+$node = (Get-Command node -CommandType Application).Source
+$python = Join-Path $repo '.venv/Scripts/python.exe'
 $config = '<向导输出的配置文件绝对路径>'
-codex mcp add df_mcp -- node (Join-Path $repo 'dist/index.js') --config $config
+codex mcp add df_mcp -- $node (Join-Path $repo 'dist/index.js') --config $config --python $python
 ```
 
 macOS / Linux：
 
 ```sh
-codex mcp add df_mcp -- node "$PWD/dist/index.js" --config '<向导输出的配置文件绝对路径>'
+node_bin="$(node -p 'process.execPath')"
+codex mcp add df_mcp -- "$node_bin" "$PWD/dist/index.js" --config '<向导输出的配置文件绝对路径>' --python "$PWD/.venv/bin/python"
 ```
+
+移动安装目录、删除旧 Node 版本或更换 Python 后，重新运行 setup/configure 并更新注册命令；不要沿用已不存在的解释器路径。`doctor --config ...` 会检查解释器与配置，实际连接仍需用 status 验证。
+
+只有 Codex 桌面应用、没有 `codex` 命令时，也可在 Codex 的 `config.toml` 中配置同样的入口。未设置 `CODEX_HOME` 时，文件位于用户目录的 `.codex/config.toml`；已设置时使用该目录下的 `config.toml`。保留其他设置，将下面占位符替换为向导打印的真实绝对路径。如果 `df_mcp` 已存在，只更新原条目，不重复添加同名 TOML 区块：
+
+```toml
+[mcp_servers.df_mcp]
+command = '<Node 可执行文件绝对路径>'
+args = ['<安装目录>/dist/index.js', '--config', '<向导生成的配置文件绝对路径>', '--python', '<专用 Python 可执行文件绝对路径>']
+```
+
+Windows 的 Python 通常为 `<安装目录>\.venv\Scripts\python.exe`，Mac/Linux 为 `<安装目录>/.venv/bin/python`。这里的 Codex 配置文件只保存启动入口；JSON 内的 `state_dir` 仍必须在 `.codex` 之外。保存后完整退出并重新打开 Codex，以释放旧连接。
 
 这里的 `df_mcp` 是客户端连接名称；Skill 仍为 `$df-mcp`，工具名保留 `team_drive_` 前缀兼容现有调用。旧版本用户应先关闭旧会话，在客户端移除旧 `team_drive` 连接，再添加新连接，避免保留重复注册。其他支持 stdio 的客户端参考 [examples/mcp.json](examples/mcp.json)，替换路径占位符。启动新会话，让客户端发现 Skill 和工具。Windows 上已经使用临时 launcher 或修改过 `dist/index.js` 的用户，按[迁移说明](docs/WINDOWS_MIGRATION.md)检查、备份并替换。
 
@@ -145,9 +166,14 @@ npm run test:doctor
 npm run test:backend
 npm run test:mcp
 npm run test:concurrency
+npm run test:install
 ```
 
 测试使用隔离临时目录和虚构资料。`--skip-config` 只跳过目录配置，不创建可用的个人读取连接。已有依赖和编译结果时可直接运行测试。
+
+CI 在 Windows、macOS、Linux 的清洁检出中安装依赖并构建，覆盖 Python 3.9 与 3.13。`test:install` 另外使用临时用户目录运行真实配置、Skill 安装和诊断命令，再启动两份 MCP 客户端检查同文件读取、共享实例、关闭重开与来源不变。它验证默认路径与安装流程；不能代替每台电脑的企业策略、源 ACL 或 Codex 应用级验收。
+
+新安装的最小验收：在两条聊天各自调用 status，确认版本为 0.3.0、`state_storage.mode=shared`、同一个 `instance_id`，再 inspect/read 同一文件。完整退出并重开 Codex 后重复一次。失败时保留结构化错误，用明确配置运行 doctor；不要创建随机状态目录或删除活动锁文件作为修复。
 
 `npm run demo` 显式启动模拟目录的 stdio 服务；它不提供聊天界面，需 MCP 客户端发送协议请求。也可将客户端 `--config` 指向仓库 `examples/config.sample.json`，用 `$df-mcp` 查询样本。演示配置使用独立的 `.local/sample-v02-state/`，不会自动替换你的正式配置或复用 0.1 旧演示缓存。
 

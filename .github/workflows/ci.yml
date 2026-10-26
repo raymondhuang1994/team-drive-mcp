@@ -2,13 +2,18 @@ name: validate
 on: [push, pull_request]
 permissions:
   contents: read
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 jobs:
   test:
+    name: test (${{ matrix.os }}, Python ${{ matrix.python }})
     timeout-minutes: 10
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, windows-latest, macos-latest]
+        python: ['3.9', '3.13']
     runs-on: ${{ matrix.os }}
     env:
       PYTHONUTF8: '1'
@@ -23,7 +28,7 @@ jobs:
       - uses: actions/setup-python@v7
         id: python
         with:
-          python-version: '3.11'
+          python-version: ${{ matrix.python }}
       - run: npm ci --ignore-scripts
       - run: npm run setup -- --skip-config
         env:
@@ -34,4 +39,5 @@ jobs:
       - run: npm test
       - run: npm run test:mcp
       - run: node scripts/mcp-concurrency.mjs
+      - run: npm run test:install
       - run: npm run check:public

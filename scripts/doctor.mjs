@@ -4,6 +4,8 @@ import { homedir } from 'node:os';
 import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { validateStatePath } from './configure.mjs';
+import { validateRuntimeOptions } from './config-validation.mjs';
+import { resolvePythonExecutable } from './installer-utils.mjs';
 
 const repositoryRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const help = 'Usage: node scripts/doctor.mjs --config <config.json>\nRead-only local setup inspection. Does not start a worker, scan source files, connect, repair or clean state.';
@@ -43,16 +45,7 @@ export function inspectConfiguration(configInput, { repo = repositoryRoot, env =
       const inside = (parent, child) => { const rel = relative(parent, child); return rel === '' || (rel !== '..' && !rel.startsWith(`..${sep}`) && !isAbsolute(rel)); };
       if (inside(canonicalSource, canonical) || inside(canonical, canonicalSource)) throw new Error('Source and state must not overlap.');
     });
-    check('runtime_options', () => {
-      if (config.poll_seconds !== undefined && (typeof config.poll_seconds !== 'number' || !Number.isFinite(config.poll_seconds) || config.poll_seconds < 1)) throw new Error('poll_seconds must be at least 1.');
-      if (config.service !== undefined) {
-        if (!config.service || typeof config.service !== 'object' || Array.isArray(config.service)) throw new Error('service must be an object.');
-        for (const [name, value] of Object.entries(config.service)) {
-          const maximum = { idle_seconds: 3600, max_clients: 256 }[name];
-          if (!maximum || typeof value !== 'number' || !Number.isFinite(value) || (name === 'max_clients' && !Number.isInteger(value)) || value < 1 || value > maximum) throw new Error(`Unsupported service setting: ${name}.`);
-        }
-      }
-    });
+    check('runtime_options', () => validateRuntimeOptions(config));
   }
   const sourceVersion = check('installed_package', () => JSON.parse(readFileSync(join(repo, 'package.json'), 'utf8')).version);
   const entry = join(repo, 'dist', 'index.js');
@@ -64,14 +57,14 @@ export function inspectConfiguration(configInput, { repo = repositoryRoot, env =
     return match[1];
   });
   const python = env.DF_MCP_PYTHON || env.TEAM_DRIVE_PYTHON || join(repo, '.venv', platform === 'win32' ? 'Scripts/python.exe' : 'bin/python');
-  if (!existsSync(python)) warnings.push('The selected Python path is not present. Check setup or an explicit Python executable on PATH.');
+  const pythonExecutable = check('python_executable', () => resolvePythonExecutable(python, { env, platform }));
   if (config?.state_pool) warnings.push('state_pool is a legacy isolated-worker setting; ordinary MCP connections use the shared service.');
-  warnings.push('Runtime lock ownership, parser dependencies and source access security are not verified offline. Use status in a new MCP session for live health.');
+  warnings.push('Final runtime configuration parsing, interpreter version, lock ownership, parser dependencies and source access security are not verified offline. Use status in a new MCP session for live health.');
   return {
     ok: checks.every(item => item.ok), mode: 'offline_read_only', config_path: configPath,
     source_path: source, state_path: state, selected_source: source && resolve(source) === resolve(repo, 'examples', 'sample-drive') ? 'SIMULATED example source' : 'configured local source',
     installation: repo, package_version: sourceVersion, built_version: builtVersion, entrypoint: entry,
-    python, state_exists: Boolean(state && existsSync(state)), shared_index: state && join(state, 'shared-v1', 'index'),
+    python: pythonExecutable || python, state_exists: Boolean(state && existsSync(state)), shared_index: state && join(state, 'shared-v1', 'index'),
     connection_checked: false, source_scanned: false, state_modified: false, checks, warnings,
     privacy: 'Local diagnostic paths are private; redact before sharing.'
   };

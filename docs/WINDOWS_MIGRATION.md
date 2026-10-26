@@ -29,6 +29,7 @@ npm run test:doctor
 npm run test:backend
 npm run test:mcp
 npm run test:concurrency
+npm run test:install
 ```
 
 `setup` 从受管理源码构建 `dist/index.js`。不要把临时修改过的 `dist` 当作下一版的源码，也不要只重装 Skill。保留构建结果和运行版本记录；任一步失败先处理该失败，不开始替换生产连接。
@@ -52,11 +53,11 @@ npm run configure -- --root 'C:\MCP TEST' --state-dir $stateBase --yes
 
 ```toml
 [mcp_servers.df_mcp]
-command = "node"
-args = ['<安装目录>\dist\index.js', '--config', '<外部配置目录>\config.json']
+command = '<已核实的 Node 可执行文件绝对路径>'
+args = ['<安装目录>\dist\index.js', '--config', '<外部配置目录>\config.json', '--python', '<安装目录>\.venv\Scripts\python.exe']
 ```
 
-保留其他 MCP 条目，以及本条目仍需要的已批准超时和环境配置；删除本条目中仅用于旧临时 launcher 的参数或变量前先核对其用途。新 `command` / `args` 不再经过 `.codex\df-mcp-instance-launcher.cjs`。保留该文件和备份用于追溯，完成验收后才按维护流程归档；它位于磁盘上但未被引用，不会启动旧索引。
+优先使用新版配置向导打印的完整命令，它包含绝对 Node 与专用 Python 路径，避免桌面 PATH 或旧 Python 环境变量选错解释器。保留其他 MCP 条目，以及本条目仍需要的已批准超时和环境配置；删除本条目中仅用于旧临时 launcher 的参数或变量前先核对其用途。新 `command` / `args` 不再经过 `.codex\df-mcp-instance-launcher.cjs`。保留该文件和备份用于追溯，完成验收后才按维护流程归档；它位于磁盘上但未被引用，不会启动旧索引。
 
 重开 Codex，创建新聊天验证。已经报 `Transport closed` 的旧聊天可能仍持有失效 MCP 连接，需要关闭并新建聊天或重新连接。服务可在活动 Node 传输下按需恢复意外断开的共享服务连接；已被客户端关闭的 stdio 传输不能由修改配置或 Skill 复活。
 

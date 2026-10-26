@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import { join, relative } from 'node:path';
 import test from 'node:test';
 import { defaultStateBase, makePlan, parseArguments, preflightRoot, repositoryRoot, runConfigure, shellQuote, windowsFolderPicker } from '../scripts/configure.mjs';
-import { discoverPython } from '../scripts/installer-utils.mjs';
+import { currentNodeExecutable, discoverPython, venvPython } from '../scripts/installer-utils.mjs';
 import { installSkill } from '../scripts/install-skill.mjs';
 
 function fixture(t) {
@@ -41,6 +41,8 @@ test('explicit source with Chinese/spaces creates only private configuration, ne
   assert.match(r.getOutput(), /codex mcp add df_mcp/);
   assert.match(r.getOutput(), /share one managed local index/);
   assert.doesNotMatch(r.getOutput(), /Do not start two MCP connections/);
+  assert.ok(r.getOutput().includes(`-- ${shellQuote(currentNodeExecutable())} ${shellQuote(join(f.repo, 'dist', 'index.js'))}`));
+  assert.ok(r.getOutput().includes(`--python ${shellQuote(venvPython(f.repo))}`));
 });
 
 test('blank manual selection cancels without configuration or validation', async (t) => {
@@ -165,6 +167,36 @@ test('existing profile with a different source or state is never rebound or over
   }
 });
 
+test('reuse rejects invalid runtime options without overwriting the existing profile', async (t) => {
+  const f = fixture(t), first = await runConfigure(args(f), runtime(f));
+  const bad = [{ poll_seconds: 86401 }, { aliases: { word: 'not-a-list' } }, { limits: { max_pdf_pages: 0 } }, { limits: { unknown_limit: 1 } }, { service: { max_clients: 0 } }, { service: JSON.parse('{"__proto__":1}') }];
+  for (const change of bad) {
+    const previous = JSON.stringify({ ...first.config, ...change }) + '\n';
+    writeFileSync(first.plan.configPath, previous);
+    await assert.rejects(runConfigure(args(f), runtime(f)), /poll_seconds|aliases|limits|service setting/);
+    assert.equal(readFileSync(first.plan.configPath, 'utf8'), previous);
+    assert.equal(existsSync(first.plan.state), false);
+  }
+});
+
+test('reuse bounds the configuration before parsing it or accepting a non-file', async (t) => {
+  const f = fixture(t), first = await runConfigure(args(f), runtime(f));
+  writeFileSync(first.plan.configPath, ' '.repeat(262145));
+  await assert.rejects(runConfigure(args(f), runtime(f)), /no larger than 256 KiB/);
+  assert.equal(readFileSync(first.plan.configPath).length, 262145);
+  rmSync(first.plan.configPath); mkdirSync(first.plan.configPath);
+  await assert.rejects(runConfigure(args(f), runtime(f)), /ordinary JSON file/);
+});
+
+test('equivalent profile cannot hide an unsupported linked source root', async (t) => {
+  const f = fixture(t), first = await runConfigure(args(f), runtime(f));
+  const alias = join(f.base, 'source-alias');
+  try { symlinkSync(f.source, alias, process.platform === 'win32' ? 'junction' : 'dir'); } catch (error) { if (error.code === 'EPERM') { t.skip('Symlink privilege unavailable'); return; } throw error; }
+  const previous = JSON.stringify({ ...first.config, root: alias }); writeFileSync(first.plan.configPath, previous);
+  await assert.rejects(runConfigure(args(f), runtime(f)), /linked root/);
+  assert.equal(readFileSync(first.plan.configPath, 'utf8'), previous);
+});
+
 test('changing folders produces a distinct profile without replacing an earlier one', async (t) => {
   const f = fixture(t); const first = await runConfigure(args(f), runtime(f));
   const other = join(f.base, 'other source'); mkdirSync(other);
@@ -214,6 +246,18 @@ test('Windows Python discovery uses py -3, skips Store aliases, and never uses s
   assert.equal(python.command, join(tools, 'py.exe')); assert.deepEqual(python.args, ['-3']);
   assert.equal(calls[0].argv[0], '-3'); assert.equal(calls[0].options.shell, undefined);
   assert.equal(calls[0].options.env.PYTHONUTF8, '1');
+});
+
+test('registration keeps a stable absolute Node entry only for the currently running executable', (t) => {
+  const f = fixture(t), bin = join(f.base, 'bin'); mkdirSync(bin);
+  const name = process.platform === 'win32' ? 'node.exe' : 'node';
+  const running = join(f.repo, name), other = join(bin, name);
+  writeFileSync(running, 'running-node'); writeFileSync(other, 'other-node');
+  chmodSync(running, 0o700); chmodSync(other, 0o700);
+  assert.equal(currentNodeExecutable({ env: { PATH: bin }, execPath: running }), running);
+  rmSync(other);
+  try { symlinkSync(running, other, 'file'); } catch (error) { if (error.code === 'EPERM') { t.skip('File symlink privilege unavailable'); return; } throw error; }
+  assert.equal(currentNodeExecutable({ env: { PATH: bin }, execPath: running }), other);
 });
 
 test('Windows folder picker uses a fixed command, disables new folders, and preserves Unicode', (t) => {
