@@ -11,11 +11,12 @@ import { fileURLToPath } from 'node:url';
 import { Client } from '@modelcontextprotocol/client';
 import { StdioClientTransport } from '@modelcontextprotocol/client/stdio';
 
-const repository = resolve(dirname(fileURLToPath(import.meta.url)), '..');
+const repository = realpathSync.native(resolve(dirname(fileURLToPath(import.meta.url)), '..'));
 const version = JSON.parse(readFileSync(join(repository, 'package.json'), 'utf8')).version;
 const python = join(repository, '.venv', process.platform === 'win32' ? 'Scripts/python.exe' : 'bin/python');
 assert.ok(existsSync(python) && existsSync(join(repository, 'dist/index.js')), 'Run npm ci and npm run setup -- --skip-config first.');
-const temporary = realpathSync(mkdtempSync(join(tmpdir(), 'df-mcp-install-')));
+// Match configure's native path canonicalization, including Windows 8.3 aliases.
+const temporary = realpathSync.native(mkdtempSync(join(tmpdir(), 'df-mcp-install-')));
 const testHome = join(temporary, '模拟用户 home');
 const codexHome = join(testHome, '.codex');
 const source = join(temporary, '团队资料 read only');
@@ -104,7 +105,7 @@ function registrationFrom(output, config) {
   assert.equal(quoted, false, 'Unclosed registration quote.');
   if (started) tokens.push(value);
   assert.ok(isAbsolute(tokens[0]));
-  assert.equal(realpathSync(tokens[0]), realpathSync(process.execPath), 'The absolute launcher must refer to the current validated Node interpreter.');
+  assert.equal(realpathSync.native(tokens[0]), realpathSync.native(process.execPath), 'The absolute launcher must refer to the current validated Node interpreter.');
   assert.deepEqual(tokens.slice(1), [join(repository, 'dist/index.js'), '--config', config, '--python', python]);
   return { command: tokens[0], args: tokens.slice(1) };
 }
@@ -115,7 +116,9 @@ async function connect(config, label) {
   const transport = new StdioClientTransport({
     ...registration,
     // Use the CLI's actual recommendation from a different working directory.
-    cwd: temporary, env: childEnvironment, stderr: 'pipe'
+    cwd: temporary,
+    env: { ...childEnvironment, PATH: join(temporary, 'empty desktop PATH'), DF_MCP_PYTHON: join(temporary, 'wrong-python') },
+    stderr: 'pipe'
   });
   transport.stderr.on('data', data => stderr.push(data.toString()));
   await client.connect(transport);
@@ -274,6 +277,7 @@ try {
     realConfigurationCli: true, defaultStateOutsideCodex: true,
     unicodeAndSpaces: true, profiles: 1, preservedCustomConfiguration: true,
     skillInstallAndExplicitUpgradeBackup: true, actualRecommendedLaunchCommand: true, absoluteInstalledInterpreter: true,
+    desktopPathAndPythonOverrideIsolation: true,
     simultaneousClients: 2, persistentIndexes: 1, idleRestartReusedParsedRows: true,
     codexAtomicReplacement: true, sourceUnchanged: true,
     scope: 'Fresh generated profile and Skill installation on an already installed and built checkout; no dependency downloads or Codex UI automation.'
