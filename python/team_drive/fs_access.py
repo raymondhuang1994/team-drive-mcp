@@ -257,9 +257,11 @@ if os.name == "nt":
     from types import SimpleNamespace
 
     _kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    _ntdll = ctypes.WinDLL("ntdll")
     _INVALID = ctypes.c_void_p(-1).value
     _READ = 0x80000000
     _WRITE = 0x40000000
+    _DELETE = 0x00010000
     _SHARE_READ_WRITE = 0x1 | 0x2  # Never FILE_SHARE_DELETE for pinned objects.
     _OPEN_EXISTING = 3
     _OPEN_ALWAYS = 4
@@ -298,6 +300,21 @@ if os.name == "nt":
     _kernel.GetFileType.restype = wintypes.DWORD
     _kernel.MoveFileExW.argtypes = [wintypes.LPCWSTR, wintypes.LPCWSTR, wintypes.DWORD]
     _kernel.MoveFileExW.restype = wintypes.BOOL
+
+    class _IoStatusBlock(ctypes.Structure):
+        # The first native field is a union of NTSTATUS and pointer. Keeping its
+        # pointer width supplies the required 32/64-bit alignment.
+        _fields_ = [("status", ctypes.c_void_p), ("information", ctypes.c_size_t)]
+
+    class _RenameInformation(ctypes.Structure):
+        _fields_ = [("replace", ctypes.c_ubyte), ("root", wintypes.HANDLE),
+                    ("length", wintypes.DWORD), ("name", wintypes.WCHAR * 1)]
+
+    _ntdll.NtSetInformationFile.argtypes = [wintypes.HANDLE, ctypes.POINTER(_IoStatusBlock),
+                                          ctypes.c_void_p, wintypes.ULONG, ctypes.c_int]
+    _ntdll.NtSetInformationFile.restype = wintypes.LONG
+    _ntdll.RtlNtStatusToDosError.argtypes = [wintypes.LONG]
+    _ntdll.RtlNtStatusToDosError.restype = wintypes.ULONG
 
     def _extended(path):
         return "\\\\?\\" + str(path)
@@ -349,8 +366,8 @@ if os.name == "nt":
         value = buffer.value
         return value[4:] if value.startswith("\\\\?\\") else value
 
-    def _handle(path, directory=False, write=False, create=False, exclusive=False, metadata_read=False):
-        access = _READ | (_WRITE if write else 0)
+    def _handle(path, directory=False, write=False, create=False, exclusive=False, metadata_read=False, rename=False):
+        access = _READ | (_WRITE if write else 0) | (_DELETE if rename else 0)
         # Pin directory metadata as well as its name: disallow write sharing so
         # SetReparsePoint cannot redirect an already approved directory in place.
         sharing = 0 if exclusive else 0x1 if directory else _SHARE_READ_WRITE
@@ -364,6 +381,30 @@ if os.name == "nt":
         if value == _INVALID:
             raise OSError(ctypes.get_last_error(), "Cannot open an approved local object.")
         return value
+
+    def _rename_same_directory(handle, name):
+        """Atomically replace a sibling without reopening its pinned parent.
+
+        A full-path MoveFileEx/Win32 rename opens the target parent with write
+        access, conflicting with the guard that prevents in-place reparse
+        changes. Native FileRenameInformation explicitly permits a basename
+        with a null RootDirectory for a rename within the source directory.
+        The source DELETE handle and every directory guard stay pinned; no
+        source-read sharing rules are relaxed. See Microsoft's documented
+        FILE_RENAME_INFORMATION same-directory form.
+        """
+        encoded = name.encode("utf-16-le")
+        size = _RenameInformation.name.offset + len(encoded)
+        buffer = ctypes.create_string_buffer(max(size, ctypes.sizeof(_RenameInformation)))
+        info = _RenameInformation.from_buffer(buffer)
+        info.replace = 1
+        info.root = None
+        info.length = len(encoded)
+        ctypes.memmove(ctypes.addressof(buffer) + _RenameInformation.name.offset, encoded, len(encoded))
+        result = _IoStatusBlock()
+        status = _ntdll.NtSetInformationFile(handle, ctypes.byref(result), buffer, size, 10)
+        if status < 0:
+            raise ctypes.WinError(_ntdll.RtlNtStatusToDosError(status))
 
     def _cloud(info):
         # Cloud tags have provider-specific bits in positions 12 through 15.
@@ -729,10 +770,19 @@ class StateAccess:
                 os.close(fd)
         self.check()
         if os.name == "nt":
-            # Flush the source first; WRITE_THROUGH asks Windows to complete the
-            # rename durably before returning. Directory guards remain pinned.
-            if not _kernel.MoveFileExW(_extended(self.path / source_name), _extended(self.path / destination_name), 0x1 | 0x8):
-                raise OSError(ctypes.get_last_error(), "Cannot publish private state atomically.")
+            handle = _handle(self.path / source_name, rename=True)
+            try:
+                info = _file_info(handle)
+                if (info.st_file_attributes & (_REPARSE | _DIRECTORY) or info.st_nlink != 1 or
+                        _final_path(handle) != _canonical(self.path / source_name)):
+                    raise DriveError("UNSAFE_STATE", "The private publication source has been redirected.")
+                # Writers already fsync and close staging data before publishing.
+                # Keep this verified source handle open through the atomic rename.
+                _rename_same_directory(handle, destination_name)
+                if _final_path(handle) != _canonical(self.path / destination_name):
+                    raise DriveError("STATE_CHANGED", "The published state file resolved outside its expected name.")
+            finally:
+                _kernel.CloseHandle(handle)
         else:
             os.replace(source_name, destination_name, src_dir_fd=self.fd, dst_dir_fd=self.fd)
             os.fsync(self.fd)

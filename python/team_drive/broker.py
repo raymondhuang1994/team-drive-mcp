@@ -165,6 +165,11 @@ class Broker:
             except (OSError, ValueError, TypeError):
                 break
             with self.clients_lock:
+                # Idle shutdown and admission share one decision boundary. An
+                # accept that finished after shutdown began must not revive it.
+                if self.stop_event.is_set():
+                    connection.close()
+                    break
                 if len(self.connections) >= self.config["max_clients"]:
                     # This bounded reply contains no private status or source information.
                     try:
@@ -183,6 +188,8 @@ class Broker:
             while not self.stop_event.wait(0.25):
                 with self.clients_lock:
                     idle = not self.connections and time.monotonic() - self.last_empty >= self.config["idle_seconds"]
+                    if idle:
+                        self.stop_event.set()
                 if idle:
                     break
         finally:

@@ -50,6 +50,7 @@ class Bridge:
     def connect(self):
         source = storage = None
         spawned = None
+        last_spawn = None
         started = time.time()
         try:
             source = SourceAccess(self.config["root"])
@@ -83,12 +84,16 @@ class Bridge:
                 if error and error.get("config_id") == self.config["config_id"] and error.get("code_id") == self.config["code_id"] and error.get("time", 0) >= started:
                     detail = error.get("result", {}).get("error", {})
                     raise DriveError(detail.get("code", "SERVICE_START_FAILED"), detail.get("message", "The shared service could not start."), detail.get("retryable", False), detail.get("next_action", "Check the local setup."))
-                if spawned is None:
+                # A contender can lose the lease to an owner already shutting
+                # down. Retry an exited contender at most once per second,
+                # within the same overall startup deadline; never replay calls.
+                if spawned is None or (spawned.poll() is not None and time.monotonic() - last_spawn >= 1):
                     options = {"start_new_session": True} if os.name != "nt" else {
                         "creationflags": subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP}
                     spawned = subprocess.Popen([sys.executable, "-m", "team_drive.broker", "--config", str(self.config["path"])],
                                                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                                                close_fds=True, **options)
+                    last_spawn = time.monotonic()
                 time.sleep(0.05)
             raise DriveError("SERVICE_START_TIMEOUT", "The shared local index did not become ready in time.", True,
                              "Retry shortly; check source access and local service health if this persists.")

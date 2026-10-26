@@ -7,6 +7,7 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 from unittest import mock
 
@@ -132,6 +133,40 @@ class StorageTests(unittest.TestCase):
         with self.assertRaises(DriveError):
             self.storage.write_metadata("endpoint.json", {"do_not_write": True})
         self.assertTrue((self.state / "endpoint.json").exists())
+
+    @unittest.skipUnless(os.name == "nt", "Actual Windows pinned-directory rename semantics")
+    def test_windows_publication_retains_guards_and_open_metadata_reader(self):
+        # Both the first profile publication and subsequent replacements used
+        # to fail with ERROR_SHARING_VIOLATION despite closing all staging fds.
+        self.storage.write_profile_manifest()
+        self.storage.write_metadata("endpoint.json", {"generation": 1})
+        guarded = tuple(self.storage.guard.handles)
+        reader = self.storage._open_root("endpoint.json", metadata_read=True)
+        try:
+            self.storage.write_metadata("endpoint.json", {"generation": 2})
+            self.assertEqual(os.read(reader, 65536), b'{"generation":1}')
+            self.assertEqual(self.storage.read_metadata("endpoint.json"), {"generation": 2})
+            self.assertEqual(tuple(self.storage.guard.handles), guarded)
+            self.storage.guard.check()
+            with self.assertRaises(OSError):
+                self.state.rename(self.base / "moved-state")
+            with self.assertRaises(OSError):
+                self.root.rename(self.base / "moved-source")
+        finally:
+            os.close(reader)
+
+    @unittest.skipUnless(os.name == "nt", "Actual Windows handle-relative rename semantics")
+    def test_windows_publication_never_uses_process_working_directory(self):
+        original = Path.cwd()
+        destination = self.base / "unrelated"
+        destination.mkdir()
+        try:
+            os.chdir(destination)
+            self.storage.write_metadata("endpoint.json", {"name": "state-only"})
+            self.assertEqual(list(destination.iterdir()), [])
+            self.assertEqual(self.storage.read_metadata("endpoint.json"), {"name": "state-only"})
+        finally:
+            os.chdir(original)
 
     @unittest.skipUnless(os.name == "posix", "POSIX fault injection; Windows pins SQLite files")
     def test_staging_file_swap_at_sqlite_open_cannot_write_source(self):
