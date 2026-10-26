@@ -69,6 +69,16 @@ class Bridge:
                         hello = receive(channel, 5)
                         if hello.get("ok") is not True:
                             error = hello.get("error", {})
+                            if error.get("code") == "SERVICE_AUTH_FAILED":
+                                # A restarted Unix owner can rebind the same
+                                # socket after we read its predecessor's token.
+                                # Retry only a demonstrably changed protected
+                                # endpoint, before any tool request is sent.
+                                current = storage.read_metadata("endpoint.json")
+                                if current and any(current.get(key) != endpoint.get(key) for key in ("instance_id", "token")):
+                                    channel.close()
+                                    channel = None
+                                    continue
                             raise DriveError(error.get("code", "SERVICE_CONNECT_FAILED"), error.get("message", "The shared service rejected this connection."), error.get("retryable", False), error.get("next_action", "Check local service configuration."))
                         self.connection = channel
                         self.session_id, self.instance_id = hello["session_id"], hello["instance_id"]

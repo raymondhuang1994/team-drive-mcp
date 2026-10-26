@@ -124,6 +124,55 @@ class BridgeStartupTests(unittest.TestCase):
             self.assertEqual(caught.exception.code, "SERVICE_CONFIGURATION_CONFLICT")
             self.assertEqual(processes, [])
 
+    def test_changed_endpoint_after_auth_failure_retries_only_handshake(self):
+        old_endpoint = {"token": "a" * 64, "instance_id": "old"}
+        new_endpoint = {"token": "b" * 64, "instance_id": "new"}
+        endpoints = iter([old_endpoint, new_endpoint, new_endpoint])
+
+        def metadata(name, processes):
+            self.assertEqual(name, "endpoint.json")
+            return next(endpoints)
+
+        old_channel, new_channel = mock.Mock(), mock.Mock()
+        with self.environment(metadata) as (bridge, processes, times, clock, receive):
+            receive.side_effect = [{"ok": False, "error": {"code": "SERVICE_AUTH_FAILED", "message": "Old credential"}},
+                                   {"ok": True, "session_id": "session", "instance_id": "new"}]
+            with mock.patch("team_drive.bridge.connect_endpoint", side_effect=[old_channel, new_channel]) as connect, mock.patch("team_drive.bridge.send") as send:
+                bridge.connect()
+            self.assertEqual(connect.call_count, 2)
+            self.assertEqual(bridge.instance_id, "new")
+            self.assertIs(bridge.connection, new_channel)
+            self.assertEqual([call.args[1]["type"] for call in send.call_args_list], ["hello", "hello"])
+            self.assertEqual([call.args[1]["token"] for call in send.call_args_list], [old_endpoint["token"], new_endpoint["token"]])
+            old_channel.close.assert_called_once_with()
+            new_channel.close.assert_not_called()
+            self.assertEqual(processes, [])
+
+    def test_unchanged_endpoint_auth_failure_remains_explicit(self):
+        endpoint = {"token": "a" * 64, "instance_id": "same"}
+        with self.environment(lambda name, processes: endpoint) as (bridge, processes, times, clock, receive):
+            receive.return_value = {"ok": False, "error": {"code": "SERVICE_AUTH_FAILED", "message": "Invalid credential"}}
+            with self.assertRaises(DriveError) as caught:
+                bridge.connect()
+            self.assertEqual(caught.exception.code, "SERVICE_AUTH_FAILED")
+            self.assertEqual(receive.call_count, 1)
+            self.assertEqual(processes, [])
+
+    def test_endpoint_rotation_does_not_extend_startup_deadline(self):
+        def metadata(name, processes):
+            self.assertEqual(name, "endpoint.json")
+            clock.now += 5
+            return {"token": str(int(clock.now)).zfill(64), "instance_id": str(clock.now)}
+
+        with self.environment(metadata) as (bridge, processes, times, clock, receive):
+            receive.return_value = {"ok": False, "error": {"code": "SERVICE_AUTH_FAILED", "message": "Rotated credential"}}
+            with self.assertRaises(DriveError) as caught:
+                bridge.connect()
+            self.assertEqual(caught.exception.code, "SERVICE_START_TIMEOUT")
+            self.assertEqual(clock.now, 30)
+            self.assertEqual(receive.call_count, 3)
+            self.assertEqual(processes, [])
+
 
 if __name__ == "__main__":
     unittest.main()
