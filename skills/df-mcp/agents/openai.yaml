@@ -1,6 +1,6 @@
 interface:
   display_name: "df mcp"
-  short_description: "Read team files with versions, citations and explicit coverage"
-  default_prompt: "Use $df-mcp to find the approved source, read the relevant evidence, and cite its version and location."
+  short_description: "Read local evidence with versions, source manifests and gaps"
+  default_prompt: "Use $df-mcp to check the connected source, collect relevant evidence, and cite its version, location and any gaps."
 policy:
   allow_implicit_invocation: true

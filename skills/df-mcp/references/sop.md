@@ -1,55 +1,31 @@
-# Evidence reading SOP
+# Reading workflow
 
-## 1. Classify the question
+## Scope and health
 
-**Lookup:** locate a clause, a stated figure, a named project's source, or a specific reference. A small set of verified excerpts may be sufficient.
+Call status and confirm the connected source identity, service capabilities, coverage and current job when provided. On older services use job_status to establish whether a scan is running. For a lookup, a few verified excerpts may suffice. Totals, rankings, cross-file comparisons and absence claims require a defined population: project, period, source set, approval status, currency and deduplication keys as applicable.
 
-**Exhaustive:** totals, complete lists, maxima/minima, rankings, absence assertions, comparisons that depend on every member of a group. Define the population before retrieval: project, period, source set, status, currency and deduplication keys as applicable.
+Enumerate that population through every list page; track exclusions and failed relevant files. If pagination changes generation/session, restart enumeration. Request refresh when freshness matters, then inspect job completion and failures. Do not repeatedly queue identical jobs or busy-poll. Cancel only a job no longer needed or explicitly stopped by the user.
 
-“Which project spent the most?” is exhaustive even when the expected answer is one project. “What does the approved policy say?” is lookup, but still requires version/authority selection.
+## Find and verify
 
-## 2. Establish coverage
+Search within the smallest appropriate prefix using names, project IDs, meaningful terms and aliases. Multi-term searches can match evidence across a file; ranking and snippets are candidate selection aids. Search does not prove that every business-relevant source was found.
 
-Call `team_drive_status`. Determine whether the initial scan finished, an update is running, files failed or were excluded, and supported content is indexed. Global parser completion is not a certificate that every business-relevant file exists in the root.
+Choose sources by explicit approval/applicability/supersession evidence, not filename or mtime alone. Disambiguate duplicate filenames by relative path and identity. Equal hashes identify byte-identical copies, not which business record should be counted.
 
-For exhaustive work, enumerate the defined population with `team_drive_list`, consume every page and record parse status. List/search cursors must belong to the same query and index generation. If a cursor becomes stale, restart enumeration; never merge unmatched pages as a complete set.
+Inspect structure, version and warnings, then read the relevant range with `expected_version`. Include the fact's header, units, notes and exceptions. Inspect groups give segment offsets; selectors use source locations (CSV rows, XLSX sheet/rows, PDF page, PPTX slide). With a selector, `start` is the offset within matching segments; there is no A1 column clipping. Text `line_bucket` ranges are navigation buckets, not the document's actual extent.
 
-If freshness is in doubt, request `team_drive_refresh`, track it with `team_drive_job_status`, and inspect failures. Do not busy-poll or repeatedly launch identical jobs. Use `team_drive_cancel` only for a job no longer needed or explicitly stopped by the user.
+Follow relevant pagination with the same selector/version. A final selected page does not prove the whole file was read. Partial text extraction may support a bounded finding; retain explicit extraction gaps, including PDF pages without usable text. If the source changes, discard the mixed-version chain and restart that file.
 
-## 3. Discover candidates
+## Collect and compute
 
-Search narrow scope first. Try project identifiers, exact filenames, relevant terms and obvious aliases. Chinese character/bigram matching and configured aliases can miss synonyms, abbreviations or unusual formatting; use alternate terms and listing to cross-check. Results are ordered by path, not by semantic relevance.
+For multiple sources, use `team_drive_evidence_bundle` when available, supplying inspected file IDs/versions and a plain-language scope. Check its manifest, per-file results and gaps before computing. A bundle keeps evidence together; it cannot certify that the chosen population is complete or approved, and its observation window is not a transactional folder snapshot.
 
-Search snippets can be stale or omit context. Reopen the candidate with `team_drive_inspect`/`team_drive_read`. For exhaustive work, search helps identify sources but does not replace complete enumeration.
+On an older service, export each source with its expected version and keep an equivalent manifest: included/excluded files, versions, locators, warnings/gaps, observations and intended filters. Export includes all supported segments, not a prior read selector. Pass returned absolute artifact paths only to authorized local analysis tools; do not upload them by implication.
 
-## 4. Select the valid source
+Calculate with deterministic code/tools, exact decimal money arithmetic, explicit currency/rounding, agreed business filters and deduplication keys. Reconcile segment counts with actual business rows. When relevant inputs are missing or partial, resolve them or label a bounded subtotal rather than an unconditional total/ranking.
 
-Check project/period, declared approval status, applicability and superseding documents. Separate draft, approved and historical versions. When two sources disagree, consult their explicit status or the user's source rules. Record unresolved conflicts.
+For a CSV calculation, see the [simulated worked example](evidence-worked-example.md) for JSONL row reconstruction, explicit filters, Decimal arithmetic and a row-level inclusion/gap ledger; adapt its business definitions to the actual evidence.
 
-If names are duplicated, distinguish relative path and source identity. Do not deduplicate solely by filename. Identical content hashes can identify byte-identical copies; different hashes do not establish which document is authoritative.
+## Answer
 
-## 5. Inspect then read
-
-Inspect the structure, version and format warnings. Structure groups return zero-based `start`/`end` segment ordinals; an unfiltered read can start at the relevant group's `start`. Alternatively use the compatible `selector`: rows for CSV/TSV, sheet plus optional rows for XLSX, a PDF page or a PPTX slide. With a selector, `start` is the offset within matching segments, not the original file ordinal. There is no A1 column-range selector. Read the smallest range that includes the fact plus its interpretation: heading, table header, units, notes and applicable exceptions. Pass the returned `source_version` as `expected_version` on subsequent reads and exports.
-
-TXT/Markdown structure `line_bucket` boundaries describe 200-line navigation buckets, not actual source extent. Use the read segment's real line locator for citations; never quote a bucket's end as the document's final line.
-
-For table-like sources, collect all columns needed to disambiguate records. A missing cell is not zero; a saved formula result is not a new calculation. For PDFs and presentations, include limitations of text extraction when the answer depends on visual content.
-
-Read additional pages whenever `has_more` indicates more relevant data, preserving the same selector. `selection_complete_in_response` refers only to the selected population in the current response; `whole_file_in_response` is false for every filtered read. Zero selected records do not prove zero business value. “Last response page” only closes the current selector; it does not prove the entire document or corpus was read. If a version mismatch occurs, discard the mixed-version chain and restart that file.
-
-## 6. Compute or hand off
-
-For a downstream calculation, export the relevant complete source through `team_drive_export`. Preserve metadata, version, warnings and `artifact_id` (relative to state). Pass the runtime absolute `artifact_path` to a local analysis tool when needed. Do not publish runtime paths, complete traces or private exports. A controlled export is source-derived local data, not permission to upload it. The export contains all supported segments of the file, not a previous read selector's subset; apply explicit downstream business filters.
-
-Use a deterministic script or available analytical tool for arithmetic. For money use exact decimal arithmetic and explicit currency/rounding. Apply project/period/status filters, deduplicate using agreed keys and reconcile row counts. This reader does not run user-provided SQL or arbitrary code.
-
-If any relevant source is missing, changed, failed or partial, either resolve the gap or label a clearly bounded subtotal. Do not output an unconditional total, ranking or complete absence statement.
-
-## 7. Answer and cite
-
-Give the conclusion supported by the evidence. Cite each material factual claim with the exact relative file, version and locator returned by the tool. Explain conflicting or unavailable evidence near the affected conclusion.
-
-For exhaustive tasks record: intended population, included/excluded files and records, exclusion reasons, parse failures, versions, observation window and computation method. Excluding irrelevant files is valid when the reason follows the stated scope; silently excluding failed relevant files is not.
-
-For public research after an internal lookup, use the host's authorized research tools only for public facts and show their sources separately. Public search cannot fill a missing internal budget, approval or contract term.
+Lead with the finding and cite exact relative file, returned locator and source version. For exhaustive work state the population, exclusions, gaps, observation window and calculation method to the extent needed for verification. Public research can supply separately sourced public facts; it cannot replace an internal approval, budget or contract term.

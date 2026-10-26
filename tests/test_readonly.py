@@ -196,8 +196,8 @@ class ReadOnlyTests(unittest.TestCase):
         real_connect = sqlite3.connect
         swapped = []
         def change_before_connect(database, *args, **kwargs):
-            if "index.sqlite" in str(database) and not swapped:
-                index = self.state / "index.sqlite"
+            if "index.working.sqlite" in str(database) and not swapped:
+                index = self.state / "index.working.sqlite"
                 if index.exists():
                     index.rename(self.state / "original-index.sqlite")
                 index.symlink_to(business)
@@ -208,6 +208,29 @@ class ReadOnlyTests(unittest.TestCase):
                 self.start()
         self.assertTrue(swapped)
         self.assertEqual(before, self.snapshot())
+
+    @unittest.skipUnless(os.name == "posix", "Windows pins state ancestors against relocation")
+    def test_state_ancestor_moved_inside_source_is_rejected_before_database_writes(self):
+        outside = self.base / "outside-state-parent"
+        self.state = outside / "state"
+        self.config.write_text(json.dumps({"root": str(self.root), "state_dir": str(self.state)}), encoding="utf-8")
+        engine = self.start()
+        engine.scan_once()
+        moved = self.root / "moved-state-parent"
+        outside.rename(moved)
+        outside.symlink_to(moved, target_is_directory=True)
+        snapshot = (moved / "state" / "index.sqlite").read_bytes()
+        working = (moved / "state" / "index.working.sqlite").read_bytes()
+        try:
+            result = engine.call("refresh")
+            self.assertFalse(result["ok"])
+            self.assertIn(result["error"]["code"], ("UNSAFE_STATE", "STATE_CHANGED"))
+            self.assertEqual((moved / "state" / "index.sqlite").read_bytes(), snapshot)
+            self.assertEqual((moved / "state" / "index.working.sqlite").read_bytes(), working)
+        finally:
+            # Restore the synthetic tree before normal shutdown/checkpoint.
+            outside.unlink()
+            moved.rename(outside)
 
     def make_directory_link(self, link, target):
         if os.name == "nt":

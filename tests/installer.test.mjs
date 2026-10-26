@@ -1,10 +1,12 @@
 import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
+import fs from 'node:fs';
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, relative } from 'node:path';
 import test from 'node:test';
 import { defaultStateBase, makePlan, parseArguments, preflightRoot, repositoryRoot, runConfigure, shellQuote, windowsFolderPicker } from '../scripts/configure.mjs';
-import { discoverPython } from '../scripts/installer-utils.mjs';
+import { currentNodeExecutable, discoverPython, venvPython } from '../scripts/installer-utils.mjs';
 import { installSkill } from '../scripts/install-skill.mjs';
 
 function fixture(t) {
@@ -39,6 +41,10 @@ test('explicit source with Chinese/spaces creates only private configuration, ne
   assert.deepEqual(readFileSync(join(f.source, '预算.txt')), original);
   assert.match(r.getOutput(), /READ ONLY/);
   assert.match(r.getOutput(), /codex mcp add df_mcp/);
+  assert.match(r.getOutput(), /share one managed local index/);
+  assert.doesNotMatch(r.getOutput(), /Do not start two MCP connections/);
+  assert.ok(r.getOutput().includes(`-- ${shellQuote(currentNodeExecutable())} ${shellQuote(join(f.repo, 'dist', 'index.js'))}`));
+  assert.ok(r.getOutput().includes(`--python ${shellQuote(venvPython(f.repo))}`));
 });
 
 test('blank manual selection cancels without configuration or validation', async (t) => {
@@ -93,12 +99,103 @@ test('linked source and linked state paths are rejected', (t) => {
   assert.throws(() => makePlan(f.source, join(linked, 'cache'), { repo: f.repo }), /symbolic links or junctions/);
 });
 
-test('identical profile is reusable and conflicting configuration is never overwritten', async (t) => {
+test('state below any .codex ancestor is rejected before validation or filesystem writes', async (t) => {
+  const f = fixture(t);
+  for (const named of ['.codex', '.CODEX', '.codex.', '.codex ']) {
+    const codex = join(f.base, 'nested', named);
+    const state = join(codex, 'df-mcp', 'state');
+    await assert.rejects(runConfigure(['--root', f.source, '--state-dir', state, '--yes'], runtime(f, {
+      platform: 'win32', env: {}, home: f.base,
+      validateRoot: () => assert.fail('must reject state before source preflight'),
+    })), /outside .codex and CODEX_HOME/);
+    assert.equal(existsSync(codex), false);
+  }
+  assert.throws(() => makePlan(f.source, join(f.base, '.CODEX', 'state'), { repo: f.repo, env: {}, home: f.base }), /outside .codex and CODEX_HOME/);
+});
+
+test('custom CODEX_HOME and a state default inside it are rejected before writes', async (t) => {
+  const f = fixture(t);
+  const codexHome = join(f.base, 'custom-client-data');
+  const r = runtime(f, { platform: 'win32', env: { CODEX_HOME: codexHome, LOCALAPPDATA: codexHome }, home: f.base });
+  await assert.rejects(runConfigure(['--root', f.source, '--state-dir', codexHome, '--yes'], r), /outside .codex and CODEX_HOME/);
+  await assert.rejects(runConfigure(['--root', f.source, '--state-dir', `${codexHome}.`, '--yes'], r), /outside .codex and CODEX_HOME/);
+  await assert.rejects(runConfigure(['--root', f.source, '--yes'], r), /outside .codex and CODEX_HOME/);
+  assert.equal(existsSync(codexHome), false);
+  const allowed = makePlan(f.source, f.state, { repo: f.repo, env: { CODEX_HOME: codexHome }, home: f.base });
+  assert.equal(allowed.base, f.state);
+});
+
+test('a physical alias of CODEX_HOME cannot conceal state inside Codex storage', (t) => {
+  const f = fixture(t);
+  const actual = join(f.base, 'client-data');
+  const codexHome = join(f.base, 'codex-alias');
+  mkdirSync(actual);
+  try { symlinkSync(actual, codexHome, process.platform === 'win32' ? 'junction' : 'dir'); } catch (error) { if (error.code === 'EPERM') { t.skip('Symlink privilege unavailable'); return; } throw error; }
+  const state = join(actual, 'df-mcp');
+  assert.throws(() => makePlan(f.source, state, { repo: f.repo, env: { CODEX_HOME: codexHome }, home: f.base }), /outside .codex and CODEX_HOME/);
+  assert.equal(existsSync(state), false);
+});
+
+test('a linked .codex directory cannot conceal an existing Codex state tree', (t) => {
+  const f = fixture(t);
+  const codexHome = join(f.base, '.codex');
+  const alias = join(f.base, 'external-looking-state');
+  mkdirSync(codexHome);
+  try { symlinkSync(codexHome, alias, process.platform === 'win32' ? 'junction' : 'dir'); } catch (error) { if (error.code === 'EPERM') { t.skip('Symlink privilege unavailable'); return; } throw error; }
+  const state = join(alias, 'df-mcp');
+  assert.throws(() => makePlan(f.source, state, { repo: f.repo, env: {}, home: f.base }), /outside .codex and CODEX_HOME/);
+  assert.equal(existsSync(join(codexHome, 'df-mcp')), false);
+});
+
+test('equivalent profile preserves key order and custom runtime options without rewriting', async (t) => {
   const f = fixture(t); const first = await runConfigure(args(f), runtime(f));
   assert.equal((await runConfigure(args(f), runtime(f))).reused, true);
-  const changed = { ...first.config, poll_seconds: 60 };
+  const changed = { aliases: { '花费': ['支出'] }, state_pool: { max_slots: 8 }, poll_seconds: 60, state_dir: './state', root: f.source, provider: 'local' };
   const previous = `${JSON.stringify(changed)}\n`; writeFileSync(first.plan.configPath, previous);
-  await assert.rejects(runConfigure(args(f), runtime(f)), /different configuration/);
+  const reused = await runConfigure(args(f), runtime(f));
+  assert.equal(reused.reused, true);
+  assert.deepEqual(reused.config, changed);
+  assert.equal(readFileSync(first.plan.configPath, 'utf8'), previous);
+});
+
+test('existing profile with a different source or state is never rebound or overwritten', async (t) => {
+  const f = fixture(t); const first = await runConfigure(args(f), runtime(f));
+  const other = join(f.base, 'other'); mkdirSync(other);
+  for (const change of [{ root: other }, { state_dir: other }]) {
+    const previous = `${JSON.stringify({ ...first.config, ...change })}\n`;
+    writeFileSync(first.plan.configPath, previous);
+    await assert.rejects(runConfigure(args(f), runtime(f)), /different source or state/);
+    assert.equal(readFileSync(first.plan.configPath, 'utf8'), previous);
+  }
+});
+
+test('reuse rejects invalid runtime options without overwriting the existing profile', async (t) => {
+  const f = fixture(t), first = await runConfigure(args(f), runtime(f));
+  const bad = [{ poll_seconds: 86401 }, { aliases: { word: 'not-a-list' } }, { limits: { max_pdf_pages: 0 } }, { limits: { unknown_limit: 1 } }, { service: { max_clients: 0 } }, { service: JSON.parse('{"__proto__":1}') }];
+  for (const change of bad) {
+    const previous = JSON.stringify({ ...first.config, ...change }) + '\n';
+    writeFileSync(first.plan.configPath, previous);
+    await assert.rejects(runConfigure(args(f), runtime(f)), /poll_seconds|aliases|limits|service setting/);
+    assert.equal(readFileSync(first.plan.configPath, 'utf8'), previous);
+    assert.equal(existsSync(first.plan.state), false);
+  }
+});
+
+test('reuse bounds the configuration before parsing it or accepting a non-file', async (t) => {
+  const f = fixture(t), first = await runConfigure(args(f), runtime(f));
+  writeFileSync(first.plan.configPath, ' '.repeat(262145));
+  await assert.rejects(runConfigure(args(f), runtime(f)), /no larger than 256 KiB/);
+  assert.equal(readFileSync(first.plan.configPath).length, 262145);
+  rmSync(first.plan.configPath); mkdirSync(first.plan.configPath);
+  await assert.rejects(runConfigure(args(f), runtime(f)), /ordinary JSON file/);
+});
+
+test('equivalent profile cannot hide an unsupported linked source root', async (t) => {
+  const f = fixture(t), first = await runConfigure(args(f), runtime(f));
+  const alias = join(f.base, 'source-alias');
+  try { symlinkSync(f.source, alias, process.platform === 'win32' ? 'junction' : 'dir'); } catch (error) { if (error.code === 'EPERM') { t.skip('Symlink privilege unavailable'); return; } throw error; }
+  const previous = JSON.stringify({ ...first.config, root: alias }); writeFileSync(first.plan.configPath, previous);
+  await assert.rejects(runConfigure(args(f), runtime(f)), /linked root/);
   assert.equal(readFileSync(first.plan.configPath, 'utf8'), previous);
 });
 
@@ -153,6 +250,18 @@ test('Windows Python discovery uses py -3, skips Store aliases, and never uses s
   assert.equal(calls[0].options.env.PYTHONUTF8, '1');
 });
 
+test('registration keeps a stable absolute Node entry only for the currently running executable', (t) => {
+  const f = fixture(t), bin = join(f.base, 'bin'); mkdirSync(bin);
+  const name = process.platform === 'win32' ? 'node.exe' : 'node';
+  const running = join(f.repo, name), other = join(bin, name);
+  writeFileSync(running, 'running-node'); writeFileSync(other, 'other-node');
+  chmodSync(running, 0o700); chmodSync(other, 0o700);
+  assert.equal(currentNodeExecutable({ env: { PATH: bin }, execPath: running }), running);
+  rmSync(other);
+  try { symlinkSync(running, other, 'file'); } catch (error) { if (error.code === 'EPERM') { t.skip('File symlink privilege unavailable'); return; } throw error; }
+  assert.equal(currentNodeExecutable({ env: { PATH: bin }, execPath: running }), other);
+});
+
 test('Windows folder picker uses a fixed command, disables new folders, and preserves Unicode', (t) => {
   const f = fixture(t); writeFileSync(join(f.repo, 'powershell.exe'), '');
   const selected = windowsFolderPicker({ env: { PATH: f.repo }, runner: (command, argv, options) => {
@@ -181,6 +290,135 @@ test('explicit skill migration backs up both names outside the skills directory'
   assert.equal(existsSync(join(home, 'skills', 'team-drive-read')), false);
   for (const backup of result.backups) { assert.ok(relative(join(home, 'skills'), backup).startsWith('..')); assert.match(readFileSync(join(backup, 'custom.md'), 'utf8'), /^custom /); }
   assert.ok(existsSync(join(home, 'skills', 'df-mcp', 'SKILL.md')));
+});
+
+test('real skill CLI copies every package file to a Unicode home on the temporary volume', (t) => {
+  const f = fixture(t);
+  const home = join(f.base, '模拟用户 home', '.codex');
+  const result = spawnSync(process.execPath, [join(repositoryRoot, 'scripts', 'install-skill.mjs')], {
+    cwd: repositoryRoot, env: { ...process.env, CODEX_HOME: home }, encoding: 'utf8', timeout: 15000, windowsHide: true
+  });
+  assert.ifError(result.error);
+  assert.equal(result.status, 0, result.stderr);
+  function compareTree(source, target) {
+    assert.deepEqual(fs.readdirSync(target).sort(), fs.readdirSync(source).sort());
+    for (const name of fs.readdirSync(source)) {
+      const input = join(source, name), output = join(target, name);
+      if (fs.lstatSync(input).isDirectory()) compareTree(input, output);
+      else assert.deepEqual(readFileSync(output), readFileSync(input), name);
+    }
+  }
+  // In Windows CI the checkout is on D: and tmpdir on C:, covering the actual
+  // cross-volume source + Unicode destination that same-fixture copies missed.
+  compareTree(join(repositoryRoot, 'skills', 'df-mcp'), join(home, 'skills', 'df-mcp'));
+  assert.deepEqual(fs.readdirSync(join(home, 'skill-backups')), []);
+});
+
+for (const failure of ['missing file', 'corrupted file', 'missing staging directory']) {
+  test(`skill staging detects ${failure} before moving an existing installation`, (t) => {
+    const f = fixture(t); fakeSkill(f.repo); const home = join(f.base, '模拟用户 home', '.codex');
+    const target = join(home, 'skills', 'df-mcp');
+    mkdirSync(target, { recursive: true }); writeFileSync(join(target, 'custom.md'), 'preserve this customization');
+    const copy = fs.copyFileSync;
+    t.mock.method(fs, 'copyFileSync', (source, destination, flags) => {
+      if (failure === 'missing file') return;
+      copy(source, destination, flags);
+      if (failure === 'corrupted file') writeFileSync(destination, 'invalid copy');
+      else rmSync(join(destination, '..'), { recursive: true });
+    });
+    assert.throws(() => installSkill(['--replace'], { repo: f.repo, codexHome: home, log: () => {} }), (error) => {
+      assert.match(error.message, /failed during verify staged package/);
+      const details = JSON.parse(error.message.split('\nDiagnostics: ')[1]);
+      assert.equal(details.phase, 'verify staged package');
+      assert.equal(details.expected.entries, 2);
+      assert.match(details.expected.sha256, /^[a-f0-9]{64}$/);
+      assert.equal(details.staged.exists, failure !== 'missing staging directory');
+      if (details.staged.exists) assert.notEqual(details.staged.manifest.sha256, details.expected.sha256);
+      assert.equal(details.parent.directory, true);
+      assert.equal(details.target.directory, true);
+      return true;
+    });
+    assert.equal(readFileSync(join(target, 'custom.md'), 'utf8'), 'preserve this customization');
+    assert.deepEqual(fs.readdirSync(join(home, 'skill-backups')), []);
+  });
+}
+
+test('skill publication failure restores both old skill names with useful diagnostics', (t) => {
+  const f = fixture(t); fakeSkill(f.repo); const home = join(f.base, '模拟用户 home', '.codex');
+  for (const name of ['team-drive-read', 'df-mcp']) {
+    mkdirSync(join(home, 'skills', name), { recursive: true }); writeFileSync(join(home, 'skills', name, 'custom.md'), `old ${name}`);
+  }
+  const rename = fs.renameSync;
+  t.mock.method(fs, 'renameSync', (source, destination) => {
+    if (source.endsWith('incoming')) throw Object.assign(new Error('simulated rename failure'), { code: 'EBUSY' });
+    rename(source, destination);
+  });
+  assert.throws(() => installSkill(['--replace'], { repo: f.repo, codexHome: home, log: () => {} }), (error) => {
+    assert.match(error.message, /failed during publish staged package: simulated rename failure/);
+    const details = JSON.parse(error.message.split('\nDiagnostics: ')[1]);
+    assert.equal(details.parent.directory, true);
+    assert.deepEqual(details.staged.manifest, details.expected);
+    assert.equal(details.target.exists, false);
+    return true;
+  });
+  for (const name of ['team-drive-read', 'df-mcp']) assert.equal(readFileSync(join(home, 'skills', name, 'custom.md'), 'utf8'), `old ${name}`);
+  assert.deepEqual(fs.readdirSync(join(home, 'skill-backups')), []);
+});
+
+test('skill rollback failure preserves the backup and reports its location', (t) => {
+  const f = fixture(t); fakeSkill(f.repo); const home = join(f.base, 'codex');
+  const target = join(home, 'skills', 'df-mcp');
+  mkdirSync(target, { recursive: true }); writeFileSync(join(target, 'custom.md'), 'recoverable customization');
+  const rename = fs.renameSync;
+  t.mock.method(fs, 'renameSync', (source, destination) => {
+    if (destination === target) throw new Error('simulated publication/restore failure');
+    rename(source, destination);
+  });
+  let failure;
+  assert.throws(() => installSkill(['--replace'], { repo: f.repo, codexHome: home, log: () => {} }), (error) => {
+    failure = error.message;
+    assert.match(failure, /Recovery needs attention/);
+    return true;
+  });
+  const backups = fs.readdirSync(join(home, 'skill-backups'));
+  assert.equal(backups.length, 1);
+  assert.ok(failure.includes(join(home, 'skill-backups', backups[0], 'df-mcp')));
+  assert.equal(readFileSync(join(home, 'skill-backups', backups[0], 'df-mcp', 'custom.md'), 'utf8'), 'recoverable customization');
+  assert.equal(existsSync(target), false);
+});
+
+test('failure backing up the second old skill restores the first one', (t) => {
+  const f = fixture(t); fakeSkill(f.repo); const home = join(f.base, 'codex');
+  for (const name of ['df-mcp', 'team-drive-read']) {
+    mkdirSync(join(home, 'skills', name), { recursive: true }); writeFileSync(join(home, 'skills', name, 'custom.md'), `old ${name}`);
+  }
+  const rename = fs.renameSync;
+  t.mock.method(fs, 'renameSync', (source, destination) => {
+    if (source === join(home, 'skills', 'team-drive-read')) throw new Error('simulated second backup failure');
+    rename(source, destination);
+  });
+  assert.throws(() => installSkill(['--replace'], { repo: f.repo, codexHome: home, log: () => {} }), /failed during back up previous skill/);
+  for (const name of ['df-mcp', 'team-drive-read']) assert.equal(readFileSync(join(home, 'skills', name, 'custom.md'), 'utf8'), `old ${name}`);
+  assert.deepEqual(fs.readdirSync(join(home, 'skill-backups')), []);
+});
+
+test('a concurrently occupied restore destination and the old backup are both preserved', (t) => {
+  const f = fixture(t); fakeSkill(f.repo); const home = join(f.base, 'codex');
+  const target = join(home, 'skills', 'df-mcp');
+  mkdirSync(target, { recursive: true }); writeFileSync(join(target, 'custom.md'), 'old customization');
+  const rename = fs.renameSync;
+  t.mock.method(fs, 'renameSync', (source, destination) => {
+    if (source.endsWith('incoming')) {
+      mkdirSync(destination); writeFileSync(join(destination, 'concurrent.md'), 'another installer owns this');
+      throw new Error('simulated occupied target');
+    }
+    rename(source, destination);
+  });
+  assert.throws(() => installSkill(['--replace'], { repo: f.repo, codexHome: home, log: () => {} }), /Restore destination is occupied/);
+  assert.equal(readFileSync(join(target, 'concurrent.md'), 'utf8'), 'another installer owns this');
+  const backups = fs.readdirSync(join(home, 'skill-backups'));
+  assert.equal(backups.length, 1);
+  assert.equal(readFileSync(join(home, 'skill-backups', backups[0], 'df-mcp', 'custom.md'), 'utf8'), 'old customization');
 });
 
 

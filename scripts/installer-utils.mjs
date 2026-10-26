@@ -1,6 +1,14 @@
 import { spawnSync } from 'node:child_process';
-import { existsSync, statSync } from 'node:fs';
-import { delimiter, join, resolve } from 'node:path';
+import { accessSync, constants, existsSync, realpathSync, statSync } from 'node:fs';
+import { delimiter, isAbsolute, join, resolve } from 'node:path';
+
+function executableFile(path, platform) {
+  try {
+    if (!statSync(path).isFile()) return false;
+    if (platform !== 'win32') accessSync(path, constants.X_OK);
+    return true;
+  } catch { return false; }
+}
 
 export function findExecutable(name, { platform = process.platform, env = process.env } = {}) {
   const names = platform === 'win32' && !name.toLowerCase().endsWith('.exe') ? [`${name}.exe`] : [name];
@@ -8,10 +16,30 @@ export function findExecutable(name, { platform = process.platform, env = proces
     if (!directory || (platform === 'win32' && /(?:^|[\\/])WindowsApps(?:[\\/]|$)/i.test(directory))) continue;
     for (const entry of names) {
       const path = resolve(directory, entry);
-      try { if (statSync(path).isFile()) return path; } catch { /* Try the next PATH entry. */ }
+      if (executableFile(path, platform)) return path;
     }
   }
   return null;
+}
+
+export function resolvePythonExecutable(command, { platform = process.platform, env = process.env } = {}) {
+  const selected = isAbsolute(command) || command.includes('/') || command.includes('\\') ? resolve(command) : findExecutable(command, { platform, env });
+  if (!selected || (platform === 'win32' && /(?:^|[\\/])WindowsApps(?:[\\/]|$)/i.test(selected)) || !executableFile(selected, platform)) throw new Error('The selected Python executable is missing or not executable. Run npm run setup or correct DF_MCP_PYTHON.');
+  return selected;
+}
+
+export function currentNodeExecutable({ platform = process.platform, env = process.env, execPath = process.execPath } = {}) {
+  // Keep a stable absolute PATH entry (e.g. a Homebrew symlink) only when it
+  // resolves to the Node actually running setup. Never select a different Node.
+  const candidate = findExecutable('node', { platform, env });
+  const canonical = path => {
+    const value = realpathSync.native(path);
+    return platform === 'win32' ? value.toLowerCase() : value;
+  };
+  if (candidate) {
+    try { if (canonical(candidate) === canonical(execPath)) return candidate; } catch { /* Use the running executable. */ }
+  }
+  return resolve(execPath);
 }
 
 export function discoverPython({ platform = process.platform, env = process.env, runner = spawnSync } = {}) {

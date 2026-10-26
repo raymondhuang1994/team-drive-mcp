@@ -1,42 +1,23 @@
-# Evidence, coverage and recovery
+# Evidence and recovery
 
-## Required interpretation
-
-Use the tool schema and actual result for field names. Preserve these concepts when answering or handing data to another workflow:
-
-- **Identity:** relative source path and file identity; never replace duplicate filenames with an ambiguous bare name.
-- **Version:** content hash/version and observed modification metadata. A version identifies bytes, not approval status.
-- **Locator:** line/paragraph, page, slide, sheet or cell information actually returned. Do not manufacture Word page numbers or unsupported cell ranges.
-- **Coverage:** selected scope, processed/failed/excluded source state, pagination and parser warnings.
-- **Freshness:** when the index was scanned and when the source was checked. An index timestamp is not the source's effective business date.
-- **Artifact provenance:** for export, state-relative `artifact_id`, runtime absolute `artifact_path`, input version, segment count and warnings. `row_count` counts exported JSONL segments rather than business rows. Keep outputs local unless the user authorizes transmission; never publish unredacted runtime paths or private tool traces.
-
-## Error response decisions
+Preserve identity (relative path plus file ID), version, actual locator, coverage/gaps, source-check timing and export provenance. A content version identifies bytes, not approval status. `row_count` in JSONL exports counts segments, not business records. Keep absolute artifact paths and full private traces out of public answers.
 
 | Condition | Decision |
 |---|---|
-| Tools unavailable / invalid configuration | State the missing runtime or configuration. Do not pretend Skill instructions provide file access. |
-| Source outside root / symlink, junction or reparse path rejected | Stay within the approved root. A new root requires an explicit configuration decision. |
-| Root/state identity changed or unsupported Windows location | Stop using the affected configuration. Ask the user to choose a supported ordinary local folder through configuration; do not repair permissions, widen scope, or delete existing data automatically. |
-| Online-only/cloud placeholder or sharing-locked file | Report the excluded file and coverage gap. The user may provide an approved ordinary local copy or close the editing application; do not force hydration or unlock it. |
-| Source missing / deleted | Refresh when appropriate, then locate an authorized replacement. Do not answer from an obsolete cached excerpt. |
-| Index incomplete / failed files | Use only the clearly bounded verified subset. An exhaustive answer remains incomplete until relevant gaps are resolved. |
-| Source or pagination version changed | Restart the affected file read or enumeration. Never join pages from different generations without qualification. |
-| Unsupported, encrypted, damaged or image-only content | Identify the limit and request a supported or separately processed copy where necessary. |
-| Size / extraction / time limit | Return the reported limit and actionable scoped alternative. Do not promise retries will solve a deterministic cap. |
-| Formula cache absent / possibly stale | Preserve the formula and uncertainty. Do not substitute zero or claim recalculation. |
-| No search matches | Say no match was found in the searched/indexed scope. Try a meaningful alias or enumerate relevant files before stronger absence claims. |
-| Export is partial | Do not use it for an unqualified complete statistic; account for missing units or narrow the task explicitly. |
-| Job cancelled or process interrupted | Inspect persisted status and refresh as needed. A cancelled job is not successful coverage. |
+| Tools absent / invalid configuration / version mismatch | Explain the observed setup issue. Use offline doctor with an explicit configuration; do not substitute the demo library or claim Skill text provides access. |
+| `SERVICE_BUSY`, `SERVICE_CAPACITY` or legacy `STATE_POOL_EXHAUSTED` | Preserve the configuration. Retry only as advised after a client/lease is released; do not proliferate state directories. Check the reported version/storage mode. |
+| `BACKEND_UNAVAILABLE` / interrupted request | Retry on the existing MCP transport if marked retryable. Do not assume an interrupted write was undone or replayed; inspect job/artifact state first. After recovery restart session-bound pagination. |
+| `Transport closed` | Reconnect or open a new client session. Changing files cannot revive a client-closed pipe. |
+| `SERVICE_CONFIGURATION_CONFLICT` / `SERVICE_PROTOCOL_MISMATCH` | Stop/reconnect the matching service using the documented procedure. Do not mix configurations or silently alter source/state. |
+| Source outside root, root/state identity changed, unsafe state, symlink/junction/reparse rejection | Stop using the affected path. Stay inside the authorized source; no automatic permission changes, root widening or deletion. |
+| `INDEXER_UNHEALTHY`, recoverable checkpoint / `STATE_REBUILD_REQUIRED` | Follow the actual recovery status. Only explicitly rebuild disposable state when recovery cannot complete; never reset the source or erase live locks. |
+| Cloud placeholder, sharing-locked, missing or deleted file | Report the gap. Refresh when appropriate, or use an approved supported copy; do not force hydration/unlock or answer from obsolete cached content. |
+| Partial PDF / extraction gaps | Read the available pages for bounded claims and include skipped-page/gap details. A complete total/absence claim remains unsupported if relevant pages are unread. |
+| Incomplete inventory, failed relevant files or bundle gaps | Resolve the gap or label a bounded subset. Bundle creation success is not proof of complete evidence or business coverage. |
+| Stale source / stale or invalid cursor | Restart the affected file chain or enumeration without the cursor; never combine unmatched generations or sessions. |
+| Unsupported, encrypted, damaged or over-limit content | State the actual limitation and a supported scoped alternative; identical retries do not remove deterministic limits. |
+| Formula cache missing or stale | Preserve the formula/uncertainty; never substitute zero or claim recalculation. |
+| No search results | State the searched scope; try meaningful aliases or enumerate before a stronger absence conclusion. |
+| Cancelled/interrupted job | Inspect current job and coverage before refreshing. Cancellation is not successful coverage. |
 
-The service's structured tool errors distinguish failures from an empty successful result. Read the error's next action rather than reproducing internal stack traces or absolute environment paths.
-
-## Suggested answer forms
-
-Lookup: “The approved source states X. Source: relative path, returned locator, source version. The cited section applies to period Y.”
-
-Partial result: “Within the N verified source files, the subtotal is X under the stated scope. M relevant files could not be read, so this is not the complete total. Missing: …”
-
-Conflict: “Source A states X and source B states Y. Their status/period does not establish which supersedes the other. The supported conclusion is …; the unresolved issue is …”
-
-Use concise prose for ordinary questions. The evidence requirements do not require a long audit report for every lookup.
+Use the structured error's `retryable` and `next_action` fields. Do not reveal raw tracebacks. Ordinary answers can be concise: supported claim plus exact source/locator/version, with any material gap beside that claim.

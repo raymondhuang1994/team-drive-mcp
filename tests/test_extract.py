@@ -10,7 +10,7 @@ import zipfile
 from pathlib import Path
 from unittest import mock
 
-from team_drive.extract import ExtractionError, _cell_text, iter_segments
+from team_drive.extract import ExtractionError, _cell_text, _drawing_paragraphs, iter_segments
 
 
 S = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
@@ -257,6 +257,11 @@ class ExtractTests(unittest.TestCase):
         self.assertTrue(all(s["locator"]["slide"] == 1 for s in results))
         self.assertEqual("Speaker note", results[-1]["text"])
 
+    def test_ppt_explicit_line_breaks_preserve_numeric_separation(self):
+        from defusedxml import ElementTree
+        shape = ElementTree.fromstring(f'<p:sp xmlns:p="{P}" xmlns:a="{A}"><a:p><a:r><a:t>100</a:t></a:r><a:br/><a:r><a:t>200</a:t></a:r><a:tab/><a:fld><a:t>300</a:t></a:fld></a:p></p:sp>')
+        self.assertEqual(list(_drawing_paragraphs(shape)), ["100\n200\t300"])
+
     def make_pdf(self, name="document.pdf", blank=False, encrypted=False):
         from pypdf import PdfWriter
         from pypdf.generic import DecodedStreamObject, DictionaryObject, NameObject
@@ -281,13 +286,11 @@ class ExtractTests(unittest.TestCase):
         self.assertIn("123.45", result["text"])
         self.assertIn("pdf_layout_and_tables_not_verified", result["warnings"])
 
-    def test_pdf_missing_text_is_partial_then_explicit_error(self):
+    def test_pdf_missing_text_is_an_explicit_page_gap(self):
         iterator = iter_segments(self.make_pdf(blank=True), {})
         result = next(iterator)
         self.assertIn("no_extractable_text_ocr_may_be_required", result["warnings"])
-        with self.assertRaises(ExtractionError) as caught:
-            next(iterator)
-        self.assertEqual("ocr_required", caught.exception.code)
+        self.assertEqual(list(iterator), [])
         self.assertCode("encrypted", self.make_pdf(encrypted=True))
 
     def test_cli_jsonl_and_sanitized_errors(self):

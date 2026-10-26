@@ -9,7 +9,7 @@ Use the result's actual warnings and parser metadata. This table is a conservati
 | XLSX | Sheet/cell values, formula text and saved formula caches where present | No recalculation. Preserve formula and cache warnings. Dates, number formats, hidden content, merged cells, external links, charts, macros and workbook semantics require explicit consideration; blank merged cells must not be invented. |
 | DOCX | Body paragraphs and table text with structural locators | No printed page numbers or visual-layout verification. Tracked deletions are excluded; headers, footers, footnotes, comments, images and embedded objects are not extracted. Nested tables are rejected. Do not claim full-document visual coverage. |
 | PPTX | Slide text, tables and speaker-note text with slide locators | No visual reconstruction, chart/image interpretation or geometry. Table merges are not expanded. Read the relevant notes when they affect interpretation. |
-| PDF | Extracted page text with page locators | No OCR. If any page has no extracted text, the whole file is rejected with `ocr_required`; even a genuinely blank page requires review. Multi-column order, tables, mathematical notation and image labels can be misread or absent. |
+| PDF | Extracted page text with page locators | No OCR. Pages with no usable text are explicit extraction gaps; available text pages can remain readable as partial evidence. A genuinely blank page is not automatically treated as fully understood. Check the returned extraction completeness and page gaps; an all-unreadable file cannot support text claims. Multi-column order, tables, mathematical notation and image labels can be misread or absent. |
 | Other / encrypted / damaged | Metadata or explicit error | Do not claim contents were read. Offer an authorized supported-format export or a separate specialist workflow. |
 
 ## Numeric evidence
@@ -22,7 +22,7 @@ Do not use default zeros for absent cells, failed conversions, unknown quotes or
 
 Pagination reduces tool output, not necessarily initial download or parse cost. The first read may need the whole source container. Inspect/read/export hash the whole source to validate its version, which is an intentional accuracy cost for large files.
 
-Read structure first, then select relevant units. Do not assume neighboring fragments preserve every table relationship; open adjacent content when necessary. Use controlled export for large exact computations so the model does not need every row in context. Parser output is committed only after the entire parse succeeds within supported format scope; a failed parse publishes no partial body and clears old content. If the runtime rejects a file for resource limits, use an authorized pre-split or supported export; do not silently truncate or bypass the cap.
+Read structure first, then select relevant units. Do not assume neighboring fragments preserve every table relationship; open adjacent content when necessary. Use controlled export for large exact computations so the model does not need every row in context. Fatal parser failures publish no successful body and clear old content. Explicitly partial extraction (such as readable PDF pages with gaps) is reported separately; never promote it to whole-file coverage. If the runtime rejects a file for resource limits, use an authorized pre-split or supported export; do not silently truncate or bypass the cap.
 
 ## What “complete” means
 

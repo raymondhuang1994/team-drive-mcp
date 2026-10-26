@@ -481,7 +481,10 @@ def _docx(path, limits):
 
 def _drawing_paragraphs(root):
     for paragraph in root.findall(".//a:p", NS):
-        text = "".join(node.text or "" for node in paragraph.findall(".//a:t", NS))
+        text = "".join((node.text or "") if node.tag == "{" + NS["a"] + "}t" else
+                       "\n" if node.tag == "{" + NS["a"] + "}br" else "\t"
+                       for node in paragraph.iter()
+                       if node.tag in {"{" + NS["a"] + "}" + name for name in ("t", "br", "tab")})
         if text:
             yield text
 
@@ -551,8 +554,8 @@ def _pdf(path, limits):
         else:
             yield from _text_segments(text, {"kind": "page", "page": page_num},
                                       limits["max_segment_chars"], warnings)
-    if missing:
-        raise ExtractionError("ocr_required", "One or more PDF pages have no extractable text; blank or image-only pages require review.")
+    # Empty pages remain explicit gap segments. The engine records file-level
+    # partial coverage and never presents available text as a complete PDF.
 
 
 def iter_segments(path: Path, limits: Dict[str, Any]) -> Iterator[Dict[str, Any]]:
