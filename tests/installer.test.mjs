@@ -1,4 +1,6 @@
 import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
+import fs from 'node:fs';
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, relative } from 'node:path';
@@ -288,6 +290,135 @@ test('explicit skill migration backs up both names outside the skills directory'
   assert.equal(existsSync(join(home, 'skills', 'team-drive-read')), false);
   for (const backup of result.backups) { assert.ok(relative(join(home, 'skills'), backup).startsWith('..')); assert.match(readFileSync(join(backup, 'custom.md'), 'utf8'), /^custom /); }
   assert.ok(existsSync(join(home, 'skills', 'df-mcp', 'SKILL.md')));
+});
+
+test('real skill CLI copies every package file to a Unicode home on the temporary volume', (t) => {
+  const f = fixture(t);
+  const home = join(f.base, '模拟用户 home', '.codex');
+  const result = spawnSync(process.execPath, [join(repositoryRoot, 'scripts', 'install-skill.mjs')], {
+    cwd: repositoryRoot, env: { ...process.env, CODEX_HOME: home }, encoding: 'utf8', timeout: 15000, windowsHide: true
+  });
+  assert.ifError(result.error);
+  assert.equal(result.status, 0, result.stderr);
+  function compareTree(source, target) {
+    assert.deepEqual(fs.readdirSync(target).sort(), fs.readdirSync(source).sort());
+    for (const name of fs.readdirSync(source)) {
+      const input = join(source, name), output = join(target, name);
+      if (fs.lstatSync(input).isDirectory()) compareTree(input, output);
+      else assert.deepEqual(readFileSync(output), readFileSync(input), name);
+    }
+  }
+  // In Windows CI the checkout is on D: and tmpdir on C:, covering the actual
+  // cross-volume source + Unicode destination that same-fixture copies missed.
+  compareTree(join(repositoryRoot, 'skills', 'df-mcp'), join(home, 'skills', 'df-mcp'));
+  assert.deepEqual(fs.readdirSync(join(home, 'skill-backups')), []);
+});
+
+for (const failure of ['missing file', 'corrupted file', 'missing staging directory']) {
+  test(`skill staging detects ${failure} before moving an existing installation`, (t) => {
+    const f = fixture(t); fakeSkill(f.repo); const home = join(f.base, '模拟用户 home', '.codex');
+    const target = join(home, 'skills', 'df-mcp');
+    mkdirSync(target, { recursive: true }); writeFileSync(join(target, 'custom.md'), 'preserve this customization');
+    const copy = fs.copyFileSync;
+    t.mock.method(fs, 'copyFileSync', (source, destination, flags) => {
+      if (failure === 'missing file') return;
+      copy(source, destination, flags);
+      if (failure === 'corrupted file') writeFileSync(destination, 'invalid copy');
+      else rmSync(join(destination, '..'), { recursive: true });
+    });
+    assert.throws(() => installSkill(['--replace'], { repo: f.repo, codexHome: home, log: () => {} }), (error) => {
+      assert.match(error.message, /failed during verify staged package/);
+      const details = JSON.parse(error.message.split('\nDiagnostics: ')[1]);
+      assert.equal(details.phase, 'verify staged package');
+      assert.equal(details.expected.entries, 2);
+      assert.match(details.expected.sha256, /^[a-f0-9]{64}$/);
+      assert.equal(details.staged.exists, failure !== 'missing staging directory');
+      if (details.staged.exists) assert.notEqual(details.staged.manifest.sha256, details.expected.sha256);
+      assert.equal(details.parent.directory, true);
+      assert.equal(details.target.directory, true);
+      return true;
+    });
+    assert.equal(readFileSync(join(target, 'custom.md'), 'utf8'), 'preserve this customization');
+    assert.deepEqual(fs.readdirSync(join(home, 'skill-backups')), []);
+  });
+}
+
+test('skill publication failure restores both old skill names with useful diagnostics', (t) => {
+  const f = fixture(t); fakeSkill(f.repo); const home = join(f.base, '模拟用户 home', '.codex');
+  for (const name of ['team-drive-read', 'df-mcp']) {
+    mkdirSync(join(home, 'skills', name), { recursive: true }); writeFileSync(join(home, 'skills', name, 'custom.md'), `old ${name}`);
+  }
+  const rename = fs.renameSync;
+  t.mock.method(fs, 'renameSync', (source, destination) => {
+    if (source.endsWith('incoming')) throw Object.assign(new Error('simulated rename failure'), { code: 'EBUSY' });
+    rename(source, destination);
+  });
+  assert.throws(() => installSkill(['--replace'], { repo: f.repo, codexHome: home, log: () => {} }), (error) => {
+    assert.match(error.message, /failed during publish staged package: simulated rename failure/);
+    const details = JSON.parse(error.message.split('\nDiagnostics: ')[1]);
+    assert.equal(details.parent.directory, true);
+    assert.deepEqual(details.staged.manifest, details.expected);
+    assert.equal(details.target.exists, false);
+    return true;
+  });
+  for (const name of ['team-drive-read', 'df-mcp']) assert.equal(readFileSync(join(home, 'skills', name, 'custom.md'), 'utf8'), `old ${name}`);
+  assert.deepEqual(fs.readdirSync(join(home, 'skill-backups')), []);
+});
+
+test('skill rollback failure preserves the backup and reports its location', (t) => {
+  const f = fixture(t); fakeSkill(f.repo); const home = join(f.base, 'codex');
+  const target = join(home, 'skills', 'df-mcp');
+  mkdirSync(target, { recursive: true }); writeFileSync(join(target, 'custom.md'), 'recoverable customization');
+  const rename = fs.renameSync;
+  t.mock.method(fs, 'renameSync', (source, destination) => {
+    if (destination === target) throw new Error('simulated publication/restore failure');
+    rename(source, destination);
+  });
+  let failure;
+  assert.throws(() => installSkill(['--replace'], { repo: f.repo, codexHome: home, log: () => {} }), (error) => {
+    failure = error.message;
+    assert.match(failure, /Recovery needs attention/);
+    return true;
+  });
+  const backups = fs.readdirSync(join(home, 'skill-backups'));
+  assert.equal(backups.length, 1);
+  assert.ok(failure.includes(join(home, 'skill-backups', backups[0], 'df-mcp')));
+  assert.equal(readFileSync(join(home, 'skill-backups', backups[0], 'df-mcp', 'custom.md'), 'utf8'), 'recoverable customization');
+  assert.equal(existsSync(target), false);
+});
+
+test('failure backing up the second old skill restores the first one', (t) => {
+  const f = fixture(t); fakeSkill(f.repo); const home = join(f.base, 'codex');
+  for (const name of ['df-mcp', 'team-drive-read']) {
+    mkdirSync(join(home, 'skills', name), { recursive: true }); writeFileSync(join(home, 'skills', name, 'custom.md'), `old ${name}`);
+  }
+  const rename = fs.renameSync;
+  t.mock.method(fs, 'renameSync', (source, destination) => {
+    if (source === join(home, 'skills', 'team-drive-read')) throw new Error('simulated second backup failure');
+    rename(source, destination);
+  });
+  assert.throws(() => installSkill(['--replace'], { repo: f.repo, codexHome: home, log: () => {} }), /failed during back up previous skill/);
+  for (const name of ['df-mcp', 'team-drive-read']) assert.equal(readFileSync(join(home, 'skills', name, 'custom.md'), 'utf8'), `old ${name}`);
+  assert.deepEqual(fs.readdirSync(join(home, 'skill-backups')), []);
+});
+
+test('a concurrently occupied restore destination and the old backup are both preserved', (t) => {
+  const f = fixture(t); fakeSkill(f.repo); const home = join(f.base, 'codex');
+  const target = join(home, 'skills', 'df-mcp');
+  mkdirSync(target, { recursive: true }); writeFileSync(join(target, 'custom.md'), 'old customization');
+  const rename = fs.renameSync;
+  t.mock.method(fs, 'renameSync', (source, destination) => {
+    if (source.endsWith('incoming')) {
+      mkdirSync(destination); writeFileSync(join(destination, 'concurrent.md'), 'another installer owns this');
+      throw new Error('simulated occupied target');
+    }
+    rename(source, destination);
+  });
+  assert.throws(() => installSkill(['--replace'], { repo: f.repo, codexHome: home, log: () => {} }), /Restore destination is occupied/);
+  assert.equal(readFileSync(join(target, 'concurrent.md'), 'utf8'), 'another installer owns this');
+  const backups = fs.readdirSync(join(home, 'skill-backups'));
+  assert.equal(backups.length, 1);
+  assert.equal(readFileSync(join(home, 'skill-backups', backups[0], 'df-mcp', 'custom.md'), 'utf8'), 'old customization');
 });
 
 

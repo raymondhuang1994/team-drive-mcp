@@ -42,7 +42,7 @@ npm run install:skill
 
 无需模型 API key 或数据库服务器。Windows 安装脚本优先查找 `py -3`，再尝试可用的 `python`；系统商店跳转别名不作为可用解释器。支持与构建步骤遇到错误时应先解决该错误，不能把未成功的安装当作可用服务。
 
-Skill 安装到个人 Codex 技能目录，名称为 `df-mcp`。同名目标或旧 `team-drive-read` 已存在时默认拒绝改动；明确更新或迁移旧 `team-drive-read` 可执行 `npm run install:skill -- --replace`，脚本先备份原 Skill 到 Codex 配置目录中的 `skill-backups/`，再安装。Skill 只包含操作规范，MCP 连接按下一节配置。
+Skill 安装到个人 Codex 技能目录，名称为 `df-mcp`。同名目标或旧 `team-drive-read` 已存在时默认拒绝改动；明确更新或迁移旧 `team-drive-read` 可执行 `npm run install:skill -- --replace`，脚本先在目标磁盘逐文件复制并校验完整性，再备份原 Skill 到 Codex 配置目录中的 `skill-backups/` 并发布。复制失败不改动原安装；发布失败会尝试恢复原安装，无法自动恢复时保留备份并报告路径。支持中文/空格用户路径及仓库与用户目录位于不同磁盘的安装。Skill 只包含操作规范，MCP 连接按下一节配置。
 
 ### 配置位置与后续换目录
 
