@@ -12,7 +12,7 @@ const temp = mkdtempSync(join(tmpdir(), 'team-drive-smoke-'));
 const source = join(temp, 'source');
 cpSync(join(root, 'examples/sample-drive'), source, { recursive: true });
 const config = join(temp, 'config.json');
-writeFileSync(config, JSON.stringify({ provider: 'local', root: 'source', state_dir: 'state', poll_seconds: 3600, aliases: { 花费: ['支出'] } }));
+writeFileSync(config, JSON.stringify({ provider: 'local', root: 'source', state_dir: 'state', poll_seconds: 3600, service: { idle_seconds: 1 }, aliases: { 花费: ['支出'] } }));
 const client = new Client({ name: 'team-drive-integration-test', version: '0.1.0' });
 const timings = {};
 function sourceSnapshot(directory) {
@@ -56,7 +56,7 @@ try {
   const start = performance.now();
   await client.connect(new StdioClientTransport({ command: process.execPath, args: [join(root, 'dist/index.js'), '--config', config], stderr: 'pipe' }));
   const tools = await client.listTools();
-  assert.equal(tools.tools.length, 9);
+  assert.equal(tools.tools.length, 10);
   assert.equal(tools.tools.find(t => t.name === 'team_drive_export').annotations.readOnlyHint, false);
   const status = await waitForIndex();
   const coldIndexMs = Math.round(performance.now() - start);
@@ -89,8 +89,15 @@ try {
   assert.equal(rows.reduce((sum, r) => sum + cents(r[4]) - cents(r[5]) - cents(r[6]), 0n), 6999965n);
   const exported = await call('export', { file_id: file.file_id, expected_version: version });
   assert.equal(exported.row_count, 4);
-  const exportedRows = readFileSync(join(temp, 'state', exported.artifact_id), 'utf8').trim().split('\n').map(JSON.parse);
+  const exportedRows = readFileSync(exported.artifact_path, 'utf8').trim().split('\n').map(JSON.parse);
   assert.ok(exportedRows.every(r => r.source_version === version));
+  const bundle = await call('evidence_bundle', { files: [{ file_id: file.file_id, expected_version: version }], scope_description: 'Explicit synthetic CSV fixture' });
+  assert.equal(bundle.all_selected_versions_exported, true);
+  assert.equal(bundle.all_selected_text_complete, true);
+  const manifest = JSON.parse(readFileSync(bundle.artifact_path, 'utf8'));
+  assert.equal(manifest.business_completeness, 'not_established');
+  assert.equal(manifest.files.length, 1);
+  assert.equal(manifest.files[0].source_version, version);
   const tail = await call('search', { query: 'ARCHIVE-END-742' });
   const tailHit = tail.files.find(f => f.path === 'long-policy.md');
   assert.ok(tailHit);
@@ -121,4 +128,11 @@ try {
   mkdirSync(join(root, '.local'), { recursive: true });
   writeFileSync(join(root, '.local/mcp-smoke-result.json'), JSON.stringify(record, null, 2));
   console.log(JSON.stringify(record, null, 2));
-} finally { await client.close(); rmSync(temp, { recursive: true, force: true }); }
+} finally {
+  await client.close();
+  for (let attempt = 0; attempt < 100; attempt++) {
+    try { statSync(join(temp, 'state/shared-v1/control/endpoint.json')); } catch { break; }
+    await new Promise(resolve => setTimeout(resolve, 100));
+  }
+  rmSync(temp, { recursive: true, force: true, maxRetries: 20, retryDelay: 100 });
+}

@@ -19,6 +19,8 @@ from pathlib import Path, PurePosixPath
 from .errors import DriveError
 
 _DB_OPEN_LOCK = threading.Lock()
+DATABASE_NAMES = ("index.sqlite", "index.working.sqlite", "index.next.sqlite", "index.corrupt.sqlite")
+DATABASE_FILES = tuple(name + suffix for name in DATABASE_NAMES for suffix in ("", "-wal", "-shm", "-journal"))
 
 
 def _live_fds():
@@ -74,6 +76,55 @@ def overlaps(a, b):
     return contains_physical(a, b) or contains_physical(b, a)
 
 
+def validate_state_location(path):
+    """Reject Codex-owned storage before making or pinning any state directory.
+
+    Check both spelling and physical ancestry: resolve expands existing symlink,
+    junction and Windows short-name aliases even when the final child is absent.
+    Directory guards still perform their independent no-redirection checks.
+    """
+    raw = Path(path).expanduser().absolute()
+    try:
+        resolved = raw.resolve()
+        candidates = (raw, resolved)
+        if any((part.rstrip(" .") if os.name == "nt" else part).casefold() == ".codex"
+               for item in candidates for part in item.parts):
+            raise DriveError("UNSAFE_STATE", "Index state must be outside .codex and CODEX_HOME.", False,
+                             "Choose an external application-data state directory; existing state is not moved automatically.")
+        configured_home = os.environ.get("CODEX_HOME") or Path.home() / ".codex"
+        if configured_home:
+            home = Path(configured_home).expanduser().absolute()
+            homes = (home, home.resolve())
+            for parent in homes:
+                for child in candidates:
+                    # normcase covers Windows spellings of a not-yet-created home;
+                    # inode ancestry also covers existing case and short-name aliases.
+                    parent_parts = tuple(os.path.normcase(part) for part in parent.parts)
+                    child_parts = tuple(os.path.normcase(part) for part in child.parts)
+                    if child_parts[:len(parent_parts)] == parent_parts or contains_physical(parent, child):
+                        raise DriveError("UNSAFE_STATE", "Index state must be outside .codex and CODEX_HOME.", False,
+                                         "Choose an external application-data state directory; existing state is not moved automatically.")
+    except (OSError, RuntimeError):
+        raise DriveError("UNSAFE_STATE", "The state location cannot be validated safely.")
+
+
+def validate_state_boundaries(path, source, installation):
+    """Validate a state base without creating it or inspecting legacy files."""
+    raw = Path(path).expanduser()
+    validate_state_location(raw)
+    if raw.is_symlink():
+        raise DriveError("UNSAFE_STATE", "The state directory cannot be a symbolic link.")
+    path = _valid_windows_path(raw) if os.name == "nt" else raw.resolve()
+    if overlaps(path, source.root):
+        raise DriveError("UNSAFE_STATE", "Source and state directories must not contain each other.")
+    install = Path(installation).resolve()
+    if contains_physical(source.root, install):
+        raise DriveError("UNSAFE_ROOT", "The source directory cannot contain the installed application.")
+    if contains_physical(path, install):
+        raise DriveError("UNSAFE_STATE", "The state directory cannot contain the installed application.")
+    return path
+
+
 def _make_posix_state(path, source_identity):
     """Create each state component relative to its already opened parent."""
     fd = os.open(path.anchor, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
@@ -85,7 +136,11 @@ def _make_posix_state(path, source_identity):
             try:
                 child = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
             except FileNotFoundError:
-                os.mkdir(part, mode=0o700, dir_fd=fd)
+                try:
+                    os.mkdir(part, mode=0o700, dir_fd=fd)
+                except FileExistsError:
+                    # A concurrent pool claimant may have created this component.
+                    pass
                 child = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
             os.close(fd)
             fd = child
@@ -241,6 +296,8 @@ if os.name == "nt":
     _kernel.ReadFile.restype = wintypes.BOOL
     _kernel.GetFileType.argtypes = [wintypes.HANDLE]
     _kernel.GetFileType.restype = wintypes.DWORD
+    _kernel.MoveFileExW.argtypes = [wintypes.LPCWSTR, wintypes.LPCWSTR, wintypes.DWORD]
+    _kernel.MoveFileExW.restype = wintypes.BOOL
 
     def _extended(path):
         return "\\\\?\\" + str(path)
@@ -292,11 +349,15 @@ if os.name == "nt":
         value = buffer.value
         return value[4:] if value.startswith("\\\\?\\") else value
 
-    def _handle(path, directory=False, write=False, create=False, exclusive=False):
+    def _handle(path, directory=False, write=False, create=False, exclusive=False, metadata_read=False):
         access = _READ | (_WRITE if write else 0)
         # Pin directory metadata as well as its name: disallow write sharing so
         # SetReparsePoint cannot redirect an already approved directory in place.
         sharing = 0 if exclusive else 0x1 if directory else _SHARE_READ_WRITE
+        if metadata_read and not directory and not write and not create and not exclusive:
+            # Atomic endpoint JSON publication may replace a file being read.
+            # This opt-in never applies to source, directory or SQLite handles.
+            sharing |= 0x4
         value = _kernel.CreateFileW(_extended(path), access, sharing,
                                     None, _OPEN_ALWAYS if create else _OPEN_EXISTING,
                                     _OPEN_REPARSE | (_BACKUP if directory else 0), None)
@@ -320,8 +381,10 @@ if os.name == "nt":
         return path
 
     class _WindowsDirectories:
-        def __init__(self, path, create=False, code="UNSAFE_ROOT"):
+        def __init__(self, path, create=False, code="UNSAFE_ROOT", state=False):
             self.path = _valid_windows_path(path)
+            if state:
+                validate_state_location(self.path)
             self.handles = []
             self.identities = []
             self.code = code
@@ -345,6 +408,10 @@ if os.name == "nt":
                     current = Path(_long_path(current))
                     if _final_path(handle) != _canonical(current):
                         raise DriveError(code, "The opened directory resolves to an unexpected location.")
+                    if state:
+                        # Recheck canonical components while pinned, before any
+                        # child is created, to close alias/rebinding races.
+                        validate_state_location(current)
                     self.identities.append((current, info.st_dev, info.st_ino))
                 self.path = current
             except Exception as exc:
@@ -453,25 +520,19 @@ class StateAccess:
         self.guard = None
         self.db_handle = None
         self.private_db_fd = None
-        raw = Path(path).expanduser()
-        if raw.is_symlink():
-            raise DriveError("UNSAFE_STATE", "The state directory cannot be a symbolic link.")
-        self.path = _valid_windows_path(raw) if os.name == "nt" else raw.resolve()
-        if overlaps(self.path, source.root):
-            raise DriveError("UNSAFE_STATE", "Source and state directories must not contain each other.")
-        install = Path(installation).resolve()
-        if contains_physical(source.root, install):
-            raise DriveError("UNSAFE_ROOT", "The source directory cannot contain the installed application.")
-        if contains_physical(self.path, install):
-            raise DriveError("UNSAFE_STATE", "The state directory cannot contain the installed application.")
+        self.source_root = Path(source.root)
+        self.source_identity = source.identity
+        self.recovery = {"restored_snapshot": False, "discarded_working": False, "rebuilt_after_corruption": False}
+        self.path = validate_state_boundaries(path, source, installation)
         if os.name == "nt":
-            self.guard = _WindowsDirectories(self.path, create=True, code="UNSAFE_STATE")
+            self.guard = _WindowsDirectories(self.path, create=True, code="UNSAFE_STATE", state=True)
             self.path = self.guard.path
             self.identity = self.guard.identities[-1][1:]
         else:
             self.fd = _make_posix_state(self.path, source.identity)
             info = os.fstat(self.fd)
             self.identity = (info.st_dev, info.st_ino)
+        self._ancestor_identities = tuple((ancestor, _identity(ancestor)) for ancestor in (self.path,) + tuple(self.path.parents))
         try:
             self.check()
         except Exception:
@@ -480,13 +541,26 @@ class StateAccess:
 
     def check(self):
         try:
+            validate_state_location(self.path)
+            if overlaps(self.path.resolve(), self.source_root.resolve()):
+                raise DriveError("UNSAFE_STATE", "State storage has moved into the approved source boundary.")
             if self.guard:
                 self.guard.check()
             else:
                 info = os.stat(self.path, follow_symlinks=False)
                 if self.fd is None or not stat.S_ISDIR(info.st_mode) or (info.st_dev, info.st_ino) != self.identity:
                     raise OSError()
-            for name in ("index.sqlite", "index.sqlite-wal", "index.sqlite-shm", "index.sqlite-journal", ".worker.lock"):
+                if self.path.resolve() != self.path or any(_identity(path) != identity for path, identity in self._ancestor_identities):
+                    raise DriveError("STATE_CHANGED", "A state ancestor has moved or been redirected.")
+                if self.lock_fd is not None:
+                    pinned = os.fstat(self.lock_fd)
+                    current = os.stat(".worker.lock", dir_fd=self.fd, follow_symlinks=False)
+                    if not stat.S_ISREG(current.st_mode) or current.st_nlink != 1 or (pinned.st_dev, pinned.st_ino) != (current.st_dev, current.st_ino):
+                        raise DriveError("STATE_CHANGED", "The state lease file has been replaced.")
+            # The lock is verified through its opened handle in lock(). Inspecting
+            # its pathname here may fail on Windows while another worker leases
+            # it with sharing disabled, before we can report a normal busy slot.
+            for name in DATABASE_FILES:
                 path = self.path / name
                 try:
                     info = path.lstat()
@@ -498,30 +572,52 @@ class StateAccess:
             raise DriveError("STATE_CHANGED", "The state directory is missing or has been rebound.")
 
     def lock(self):
+        if self.lock_fd is not None:
+            return
         self.check()
         path = self.path / ".worker.lock"
         if os.name == "nt":
+            handle = None
             try:
                 handle = _handle(path, write=True, create=True, exclusive=True)
                 info = _file_info(handle)
-                if info.st_file_attributes & _REPARSE or info.st_nlink != 1:
-                    _kernel.CloseHandle(handle)
+                if not stat.S_ISREG(info.st_mode) or info.st_file_attributes & _REPARSE or info.st_nlink != 1 or _final_path(handle) != _canonical(path):
                     raise DriveError("UNSAFE_STATE", "The state lock is redirected or multiply linked.")
                 self.lock_fd = msvcrt.open_osfhandle(handle, os.O_RDWR | os.O_BINARY)
-            except OSError:
-                raise DriveError("STATE_IN_USE", "Another worker is using this state directory.", True, "Reuse the existing worker or use a separate state directory.")
+                handle = None
+            except OSError as exc:
+                if exc.errno in (32, 33):
+                    raise DriveError("STATE_IN_USE", "Another worker is using this state directory.", True, "Reuse the existing worker or use a separate state directory.")
+                raise DriveError("STATE_LOCK_FAILED", "The state lease could not be acquired safely.")
+            finally:
+                if handle is not None:
+                    _kernel.CloseHandle(handle)
         else:
             import fcntl
-            self.lock_fd = os.open(".worker.lock", os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600, dir_fd=self.fd)
+            # macOS can transiently return ENOENT when two O_CREAT|O_NOFOLLOW
+            # opens race on a previously absent entry. Revalidate the pinned
+            # directory and retry only that error, never links or permission errors.
+            for attempt in range(3):
+                try:
+                    self.lock_fd = os.open(".worker.lock", os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600, dir_fd=self.fd)
+                    break
+                except FileNotFoundError:
+                    self.check()
+                    if attempt == 2:
+                        raise DriveError("STATE_LOCK_FAILED", "The state lease could not be created safely.")
+                except OSError:
+                    raise DriveError("UNSAFE_STATE", "The state lock is redirected or inaccessible.")
             try:
                 info = os.fstat(self.lock_fd)
                 if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
                     raise DriveError("UNSAFE_STATE", "The state lock is unsafe.")
                 fcntl.flock(self.lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except Exception:
+            except Exception as exc:
                 os.close(self.lock_fd)
                 self.lock_fd = None
-                raise DriveError("STATE_IN_USE", "Another worker is using this state directory.", True, "Reuse the existing worker or use a separate state directory.")
+                if isinstance(exc, BlockingIOError):
+                    raise DriveError("STATE_IN_USE", "Another worker is using this state directory.", True, "Reuse the existing worker or use a separate state directory.")
+                raise
 
     @contextlib.contextmanager
     def directory(self, name, create=False):
@@ -533,7 +629,7 @@ class StateAccess:
         directory_fd = None
         try:
             if os.name == "nt":
-                guard = _WindowsDirectories(path, create=create, code="UNSAFE_STATE")
+                guard = _WindowsDirectories(path, create=create, code="UNSAFE_STATE", state=True)
             else:
                 if create:
                     try:
@@ -559,74 +655,336 @@ class StateAccess:
             if directory_fd is not None:
                 os.close(directory_fd)
 
-    def connect_database(self):
-        """Open one verified database descriptor, then use an in-memory journal.
-
-        No WAL/journal sidecars may be followed or created after approval. The
-        index is disposable: an interrupted disk write may require a rebuild.
-        """
-        import sqlite3
-        self.check()
-        path = self.path / "index.sqlite"
-        connection = None
+    @staticmethod
+    def _root_name(name):
+        if not isinstance(name, str) or re.fullmatch(r"[a-zA-Z0-9_.-]{1,96}", name) is None or name in (".", ".."):
+            raise DriveError("UNSAFE_STATE", "Invalid private metadata filename.")
         if os.name == "nt":
-            handle = _handle(path, write=True, create=True)
-            try:
-                info = _file_info(handle)
-                if info.st_file_attributes & (_REPARSE | _DIRECTORY) or info.st_nlink != 1 or _final_path(handle) != _canonical(path):
-                    raise DriveError("UNSAFE_STATE", "The index database must be an ordinary private file.")
-                self.db_handle = handle
-                buffer = ctypes.create_string_buffer(20)
-                read = wintypes.DWORD()
-                if not _kernel.ReadFile(handle, buffer, 20, ctypes.byref(read), None):
-                    raise DriveError("UNSAFE_STATE", "The pinned index header cannot be read safely.")
-                header = buffer.raw[:read.value]
-            except Exception:
-                _kernel.CloseHandle(handle)
-                self.db_handle = None
-                raise
-        else:
-            self.private_db_fd = os.open("index.sqlite", os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600, dir_fd=self.fd)
-            info = os.fstat(self.private_db_fd)
-            if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
-                raise DriveError("UNSAFE_STATE", "The index database must be an ordinary private file.")
-            header = os.pread(self.private_db_fd, 20, 0)
-        if len(header) >= 20 and header[:16] == b"SQLite format 3\0" and (header[18] == 2 or header[19] == 2):
-            raise DriveError("STATE_REBUILD_REQUIRED", "This older WAL index requires a new state directory for the safer storage format.")
-        # Refuse recovery through old or externally supplied sidecar paths.
-        if any((self.path / name).exists() for name in ("index.sqlite-wal", "index.sqlite-shm", "index.sqlite-journal")):
-            raise DriveError("STATE_REBUILD_REQUIRED", "Existing SQLite sidecars require a new state directory.")
+            _windows_component(name)
+        return name
+
+    def _require_lease(self):
+        self.check()
+        if self.lock_fd is None:
+            raise DriveError("STATE_NOT_LEASED", "This operation requires an exclusive state lease.")
+
+    def _root_exists(self, name):
+        self._root_name(name)
+        return os.path.lexists(self.path / name)
+
+    def _open_root(self, name, write=False, create=False, exclusive=False, metadata_read=False):
+        """Open a regular single-link file; callers own the returned descriptor."""
+        self.check()
+        name = self._root_name(name)
+        path = self.path / name
+        fd = None
+        handle = None
         try:
+            if os.name == "nt":
+                if exclusive and self._root_exists(name):
+                    raise FileExistsError()
+                handle = _handle(path, write=write, create=create, metadata_read=metadata_read)
+                info = _file_info(handle)
+                if info.st_file_attributes & (_REPARSE | _DIRECTORY) or _final_path(handle) != _canonical(path):
+                    raise DriveError("UNSAFE_STATE", "A private state file has been redirected.")
+                fd = msvcrt.open_osfhandle(handle, (os.O_RDWR if write else os.O_RDONLY) | os.O_BINARY)
+                handle = None
+            else:
+                flags = (os.O_RDWR if write else os.O_RDONLY) | os.O_NOFOLLOW | os.O_NONBLOCK
+                if create:
+                    flags |= os.O_CREAT
+                if exclusive:
+                    flags |= os.O_EXCL
+                fd = os.open(name, flags, 0o600, dir_fd=self.fd)
+                info = os.fstat(fd)
+            if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+                raise DriveError("UNSAFE_STATE", "Private state files must be ordinary files with one hard link.")
+            self.check()
+            return fd
+        except Exception:
+            if fd is not None:
+                os.close(fd)
+            raise
+        finally:
+            if handle is not None:
+                _kernel.CloseHandle(handle)
+
+    def unlink_root(self, name):
+        self._require_lease()
+        if not self._root_exists(name):
+            return
+        fd = self._open_root(name)
+        os.close(fd)
+        if os.name == "nt":
+            (self.path / name).unlink()
+        else:
+            os.unlink(name, dir_fd=self.fd)
+
+    def _replace_root(self, source_name, destination_name):
+        self._require_lease()
+        for name in (source_name, destination_name):
+            self._root_name(name)
+            if self._root_exists(name):
+                fd = self._open_root(name)
+                os.close(fd)
+        self.check()
+        if os.name == "nt":
+            # Flush the source first; WRITE_THROUGH asks Windows to complete the
+            # rename durably before returning. Directory guards remain pinned.
+            if not _kernel.MoveFileExW(_extended(self.path / source_name), _extended(self.path / destination_name), 0x1 | 0x8):
+                raise OSError(ctypes.get_last_error(), "Cannot publish private state atomically.")
+        else:
+            os.replace(source_name, destination_name, src_dir_fd=self.fd, dst_dir_fd=self.fd)
+            os.fsync(self.fd)
+        self.check()
+
+    def read_metadata(self, name, max_bytes=65536):
+        """Read bounded JSON with no lock required, e.g. a live broker endpoint."""
+        name = self._root_name(name)
+        if not name.endswith(".json"):
+            raise DriveError("UNSAFE_STATE", "Metadata files must use a JSON filename.")
+        try:
+            fd = self._open_root(name, metadata_read=True)
+        except FileNotFoundError:
+            return None
+        try:
+            with os.fdopen(fd, "rb") as source:
+                self._metadata_privacy(name, source.fileno())
+                data = source.read(max_bytes + 1)
+            if len(data) > max_bytes:
+                raise DriveError("INVALID_STATE_METADATA", "Private metadata exceeds its size limit.")
+            result = json.loads(data.decode("utf-8"))
+            if not isinstance(result, dict):
+                raise ValueError()
+            return result
+        except (ValueError, UnicodeError):
+            raise DriveError("INVALID_STATE_METADATA", "Private metadata must be a JSON object.")
+
+    def write_metadata(self, name, value):
+        self._require_lease()
+        name = self._root_name(name)
+        if not name.endswith(".json") or not isinstance(value, dict):
+            raise DriveError("INVALID_STATE_METADATA", "Metadata must be a JSON object with a JSON filename.")
+        self._metadata_privacy(name)
+        data = json.dumps(value, ensure_ascii=False, separators=(",", ":"), allow_nan=False).encode("utf-8")
+        if len(data) > 65536:
+            raise DriveError("INVALID_STATE_METADATA", "Private metadata exceeds its size limit.")
+        staging = self._root_name(name + ".next")
+        self.unlink_root(staging)
+        fd = self._open_root(staging, write=True, create=True, exclusive=True)
+        try:
+            with os.fdopen(fd, "wb") as output:
+                if os.name == "posix":
+                    os.fchmod(output.fileno(), 0o600)
+                output.write(data)
+                output.flush()
+                os.fsync(output.fileno())
+            self._replace_root(staging, name)
+        except Exception:
+            self.unlink_root(staging)
+            raise
+
+    def _metadata_privacy(self, name, fd=None):
+        if os.name != "posix":
+            return  # Windows metadata inherits the guarded local account directory ACL.
+        if name in ("endpoint.json", "startup-error.json"):
+            folder = os.fstat(self.fd)
+            if folder.st_uid != os.geteuid() or stat.S_IMODE(folder.st_mode) & 0o077:
+                raise DriveError("UNSAFE_STATE_PERMISSIONS", "Broker control must be owned by the current user with mode 0700.")
+        if fd is not None:
+            info = os.fstat(fd)
+            if info.st_uid != os.geteuid() or stat.S_IMODE(info.st_mode) & 0o077:
+                raise DriveError("UNSAFE_STATE_PERMISSIONS", "Private metadata must be owned by the current user with mode 0600.")
+
+    def remove_metadata(self, name):
+        if not self._root_name(name).endswith(".json"):
+            raise DriveError("UNSAFE_STATE", "Metadata files must use a JSON filename.")
+        self.unlink_root(name)
+
+    def profile_manifest(self):
+        return {"format": "df-mcp-state", "version": 1, "root": str(self.source_root),
+                "root_identity": list(self.source_identity) if self.source_identity is not None else None,
+                "storage": "atomic-sqlite-snapshot-v1"}
+
+    def write_profile_manifest(self):
+        expected = self.profile_manifest()
+        existing = self.read_metadata("profile.json")
+        if existing is not None and (existing.get("format") != expected["format"] or
+                existing.get("version") != 1 or existing.get("root") != expected["root"] or
+                existing.get("root_identity") != expected["root_identity"]):
+            raise DriveError("STATE_ROOT_MISMATCH", "State belongs to another source identity.", False,
+                             "Use explicit maintenance --reset-index --accept-source-replacement after reviewing the source change.")
+        if existing != expected:
+            self.write_metadata("profile.json", expected)
+
+    def _sqlite_open(self, name):
+        """Open SQLite without permitting any journal-path recovery or writes yet."""
+        import sqlite3
+        self._require_lease()
+        for suffix in ("-wal", "-shm", "-journal"):
+            if self._root_exists(name + suffix):
+                raise DriveError("STATE_REBUILD_REQUIRED", "Unexpected SQLite sidecars require explicit maintenance.")
+        fd = self._open_root(name, write=True, create=True)
+        expected = os.fstat(fd)
+        connection = None
+        try:
+            with os.fdopen(os.dup(fd), "rb") as header_file:
+                header = header_file.read(20)
+            if len(header) >= 20 and header[:16] == b"SQLite format 3\0" and (header[18] == 2 or header[19] == 2):
+                raise DriveError("STATE_REBUILD_REQUIRED", "Legacy WAL format requires explicit maintenance before migration.")
             with _DB_OPEN_LOCK:
                 before_fds = _live_fds() if os.name == "posix" else set()
-                connection = sqlite3.connect(path.as_uri() + "?mode=rw", uri=True, timeout=15, check_same_thread=False)
+                connection = sqlite3.connect((self.path / name).as_uri() + "?mode=rw", uri=True, timeout=15, check_same_thread=False)
                 if os.name == "posix":
                     import fcntl
                     verified = False
                     for value in _live_fds() - before_fds:
-                        if not value.isdigit():
-                            continue
                         try:
                             opened = os.fstat(int(value))
                             writable = fcntl.fcntl(int(value), fcntl.F_GETFL) & os.O_ACCMODE != os.O_RDONLY
                         except OSError:
                             continue
                         if stat.S_ISREG(opened.st_mode) and writable:
-                            if (opened.st_dev, opened.st_ino) != (info.st_dev, info.st_ino):
+                            if (opened.st_dev, opened.st_ino) != (expected.st_dev, expected.st_ino):
                                 raise DriveError("UNSAFE_STATE", "SQLite opened a redirected database file.")
                             verified = True
                     if not verified:
-                        raise DriveError("UNSAFE_STATE", "The opened SQLite descriptor could not be verified safely.")
+                        raise DriveError("UNSAFE_STATE", "The SQLite descriptor could not be verified safely.")
             self.check()
+            # SQLite may inspect a rollback journal on its first database read.
+            # Refuse even ordinary sidecars that appeared during connect before
+            # allowing any PRAGMA/schema operation to run.
+            if any(self._root_exists(name + suffix) for suffix in ("-wal", "-shm", "-journal")):
+                raise DriveError("UNSAFE_STATE", "A SQLite sidecar appeared during guarded database opening.")
             connection.execute("PRAGMA locking_mode=EXCLUSIVE")
             connection.execute("PRAGMA journal_mode=MEMORY")
-            connection.execute("PRAGMA synchronous=NORMAL")
+            connection.execute("PRAGMA synchronous=FULL")
             connection.execute("PRAGMA temp_store=MEMORY")
-            return connection
+            return connection, fd
         except Exception:
             if connection is not None:
                 connection.close()
+            os.close(fd)
             raise
+
+    def _copy_snapshot_to_working(self):
+        # No SQLite connection opens committed data: copy via guarded descriptors.
+        source_fd = self._open_root("index.sqlite")
+        target_fd = None
+        try:
+            target_fd = self._open_root("index.working.sqlite", write=True, create=True, exclusive=True)
+            with os.fdopen(os.dup(source_fd), "rb") as source, os.fdopen(os.dup(target_fd), "wb") as target:
+                while True:
+                    chunk = source.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    target.write(chunk)
+                target.flush()
+            self.check()
+        finally:
+            os.close(source_fd)
+            if target_fd is not None:
+                os.close(target_fd)
+
+    @staticmethod
+    def _corrupt_error(exc):
+        import sqlite3
+        return isinstance(exc, sqlite3.DatabaseError) and (
+            getattr(exc, "sqlite_errorcode", None) in (11, 26) or
+            "malformed" in str(exc).casefold() or "not a database" in str(exc).casefold())
+
+    def connect_database(self):
+        """Use a disposable working database and retain a complete committed snapshot.
+
+        MEMORY journaling is confined to working/staging files. A process crash
+        never publishes them: startup restores the last atomically committed
+        snapshot and reindexes any work that did not reach a checkpoint.
+        """
+        import sqlite3
+        self._require_lease()
+        manifest = self.read_metadata("profile.json")
+        if manifest is not None:
+            expected = self.profile_manifest()
+            if any(manifest.get(key) != expected[key] for key in ("format", "version", "root", "root_identity")):
+                raise DriveError("STATE_ROOT_MISMATCH", "State belongs to another source identity.", False,
+                                 "Review the changed source, then use explicit maintenance --reset-index --accept-source-replacement.")
+        for name in ("index.working.sqlite", "index.next.sqlite"):
+            if self._root_exists(name):
+                self.recovery["discarded_working"] = True
+                self.unlink_root(name)
+            for suffix in ("-wal", "-shm", "-journal"):
+                if self._root_exists(name + suffix):
+                    # These are known disposable derivatives, but reject redirects.
+                    self.unlink_root(name + suffix)
+        for suffix in ("-wal", "-shm", "-journal"):
+            if self._root_exists("index.sqlite" + suffix):
+                raise DriveError("STATE_REBUILD_REQUIRED", "Legacy SQLite sidecars require explicit maintenance before migration.")
+        committed = self._root_exists("index.sqlite")
+        if committed:
+            self._copy_snapshot_to_working()
+        try:
+            connection, fd = self._sqlite_open("index.working.sqlite")
+            try:
+                if connection.execute("PRAGMA quick_check").fetchone()[0] != "ok":
+                    raise sqlite3.DatabaseError("database disk image is malformed")
+            except Exception:
+                connection.close()
+                os.close(fd)
+                raise
+        except Exception as exc:
+            if not committed or not self._corrupt_error(exc):
+                raise
+            # Auto-recovery only owns snapshots marked by our protected manifest.
+            # Unmarked legacy/unknown files require an explicit reset instead.
+            if manifest is None:
+                raise DriveError("STATE_REBUILD_REQUIRED", "The unmarked legacy index is corrupt; explicit maintenance is required.")
+            self.unlink_root("index.working.sqlite")
+            self._replace_root("index.sqlite", "index.corrupt.sqlite")
+            self.recovery["rebuilt_after_corruption"] = True
+            connection, fd = self._sqlite_open("index.working.sqlite")
+        self.private_db_fd = fd
+        self.recovery["restored_snapshot"] = committed and not self.recovery["rebuilt_after_corruption"]
+        return connection
+
+    def checkpoint_database(self, connection):
+        """Publish one full consistent snapshot outside an active transaction.
+
+        Fixed derived names bound retained disk usage to working + committed +
+        staging and at most one quarantined corrupt snapshot. Failed publication
+        leaves the previous committed snapshot untouched.
+        """
+        import sqlite3
+        self._require_lease()
+        if connection.in_transaction:
+            raise DriveError("STATE_TRANSACTION_ACTIVE", "Checkpoint requires a completed SQLite transaction.")
+        self.unlink_root("index.next.sqlite")
+        target = None
+        fd = None
+        try:
+            target, fd = self._sqlite_open("index.next.sqlite")
+            connection.backup(target)
+            if target.execute("PRAGMA quick_check").fetchone()[0] != "ok":
+                raise DriveError("STATE_REBUILD_REQUIRED", "The working index failed snapshot verification.")
+            target.close()
+            target = None
+            os.fsync(fd)
+            os.close(fd)
+            fd = None
+            self._replace_root("index.next.sqlite", "index.sqlite")
+            return {"published": True, "storage": "atomic-sqlite-snapshot-v1"}
+        except sqlite3.DatabaseError:
+            raise DriveError("STATE_CHECKPOINT_FAILED", "The complete index snapshot could not be saved.", True,
+                             "Check free space and local storage; only complete snapshots are published.")
+        except OSError:
+            raise DriveError("STATE_CHECKPOINT_FAILED", "The complete index snapshot could not be saved.", True,
+                             "Check free space and local storage; only complete snapshots are published.")
+        finally:
+            if target is not None:
+                target.close()
+            if fd is not None:
+                os.close(fd)
+            if self._root_exists("index.next.sqlite"):
+                self.unlink_root("index.next.sqlite")
 
     @contextlib.contextmanager
     def new_private(self, path, binary=False):
@@ -720,6 +1078,50 @@ class StateAccess:
         except OSError:
             # Never recurse into a directory with unexpected content.
             pass
+
+    def cleanup_scratch(self, dry_run=False):
+        """Reclaim recognized orphan parser files only while owning this slot.
+
+        This deliberately never walks recursively, follows a redirected child,
+        removes exports, or guesses ownership of unknown files. The OS lease
+        ensures another index worker cannot be parsing in this directory.
+        """
+        self.check()
+        if self.lock_fd is None:
+            raise DriveError("STATE_NOT_LEASED", "Scratch cleanup requires an exclusive state lease.")
+        result = {"removed_files": 0, "removed_directories": 0, "skipped_directories": 0,
+                  "eligible_files": 0, "eligible_directories": 0, "dry_run": dry_run}
+        for name in os.listdir(self.path if os.name == "nt" else self.fd):
+            if re.fullmatch(r"job-temp-[0-9a-f]{32}", name) is None:
+                continue
+            try:
+                with self.directory(name) as folder:
+                    with os.scandir(folder) as entries:
+                        children = list(entries)
+                    safe = True
+                    for entry in children:
+                        info = entry.stat(follow_symlinks=False)
+                        recognized = re.fullmatch(r"(?:parsed-[0-9a-f]{32}\.jsonl|snapshot-[0-9a-f]{32}\.(?:txt|md|csv|tsv|xlsx|docx|pptx|pdf))", entry.name)
+                        if not recognized or not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or getattr(info, "st_file_attributes", 0) & 0x400:
+                            safe = False
+                            break
+                    if not safe:
+                        result["skipped_directories"] += 1
+                        continue
+                    result["eligible_files"] += len(children)
+                    result["eligible_directories"] += 1
+                    if dry_run:
+                        continue
+                    for entry in children:
+                        self.unlink_private(folder / entry.name)
+                        result["removed_files"] += 1
+                self.remove_empty_directory(name)
+                if not (self.path / name).exists():
+                    result["removed_directories"] += 1
+            except (DriveError, OSError):
+                # Unknown or concurrently altered contents need manual review.
+                result["skipped_directories"] += 1
+        return result
 
     def close(self):
         if self.private_db_fd is not None:

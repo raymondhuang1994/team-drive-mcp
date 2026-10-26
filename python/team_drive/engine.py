@@ -3,9 +3,11 @@ from __future__ import annotations
 
 import base64
 import contextlib
+import copy
 import hashlib
 import hmac
 import json
+import math
 import os
 import queue
 import re
@@ -17,11 +19,13 @@ import sys
 import threading
 import time
 import uuid
+from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from typing import Any, Dict, Optional
 
 from .errors import DriveError
-from .fs_access import SourceAccess, StateAccess, online_only
+from .fs_access import SourceAccess, StateAccess, online_only, validate_state_location
+from .state_pool import JOB_HISTORY_LIMIT, StateLease, pool_settings
 
 
 DEFAULT_LIMITS = {
@@ -32,6 +36,9 @@ DEFAULT_LIMITS = {
 SUPPORTED_SUFFIXES = {".txt", ".md", ".csv", ".tsv", ".xlsx", ".docx", ".pptx", ".pdf"}
 MAX_RESPONSE_BYTES = 65536
 MAX_SEGMENT_BYTES = 49152
+MAX_CURSOR_CHARS = 1024
+MAX_QUERY_CHARS = 500
+MAX_PREFIX_CHARS = 1024
 CJK_RE = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff]+")
 LATIN_RE = re.compile(r"[a-z0-9]+")
 
@@ -68,10 +75,10 @@ def query_tokens(value: str) -> list:
 
 
 class Engine:
-    def __init__(self, config_path: str, autostart: bool = True):
-        config_file = Path(config_path).expanduser().resolve(strict=True)
+    def __init__(self, config_path: str, autostart: bool = True, pooled: bool = False, state_override=None, config_snapshot=None):
+        config_file = Path(config_path).expanduser().resolve(strict=config_snapshot is None)
         try:
-            config = json.loads(config_file.read_text(encoding="utf-8"))
+            config = copy.deepcopy(config_snapshot) if config_snapshot is not None else json.loads(config_file.read_text(encoding="utf-8"))
         except (ValueError, OSError):
             raise DriveError("INVALID_CONFIG", "Configuration must be valid UTF-8 JSON.")
         if not isinstance(config, dict) or config.get("provider", "local") != "local":
@@ -88,30 +95,51 @@ class Engine:
                 raise DriveError("INVALID_CONFIG", "Limits must use known keys and positive integers.")
             self.limits[key] = val
         poll = config.get("poll_seconds", 30)
-        if isinstance(poll, bool) or not isinstance(poll, (int, float)) or poll < 1:
-            raise DriveError("INVALID_CONFIG", "poll_seconds must be at least one second.")
+        if isinstance(poll, bool) or not isinstance(poll, (int, float)) or not 1 <= poll <= 86400 or not math.isfinite(poll):
+            raise DriveError("INVALID_CONFIG", "poll_seconds must be a finite number between 1 and 86400 seconds.")
         self.poll_seconds = poll
         self.aliases = config.get("aliases", {})
         if not isinstance(self.aliases, dict) or any(
                 not isinstance(k, str) or not isinstance(v, list) or
                 any(not isinstance(a, str) for a in v) for k, v in self.aliases.items()):
             raise DriveError("INVALID_CONFIG", "aliases must map strings to lists of strings.")
+        max_slots = pool_settings(config)
+        parser_signature = hashlib.sha256(Path(__file__).with_name("extract.py").read_bytes()).hexdigest()
+        indexer_signature = hashlib.sha256(Path(__file__).read_bytes() + Path(__file__).with_name("fs_access.py").read_bytes()).hexdigest()
+        self._parse_binding = hashlib.sha256(_json({"parser": parser_signature, "indexer": indexer_signature, "limits": self.limits, "aliases": self.aliases, "schema": 4}).encode()).hexdigest()
+        raw_state = Path(config["state_dir"] if state_override is None else state_override).expanduser()
+        raw_state = raw_state if raw_state.is_absolute() else config_file.parent / raw_state
+        validate_state_location(raw_state)
         raw_root = Path(config["root"]).expanduser()
         raw_root = raw_root if raw_root.is_absolute() else config_file.parent / raw_root
         self._source = SourceAccess(raw_root)
         self.root = self._source.root
         self._root_identity = self._source.identity
         self._storage = None
-        raw_state = Path(config["state_dir"]).expanduser()
-        raw_state = raw_state if raw_state.is_absolute() else config_file.parent / raw_state
+        self._lease = None
         try:
-            self._storage = StateAccess(raw_state, self._source, Path(__file__).resolve().parents[2])
+            self._root_binding = hashlib.sha256(_json({"path": str(self.root), "identity": self._root_identity}).encode()).hexdigest()
+            installation = Path(__file__).resolve().parents[2]
+            if pooled:
+                self._lease = StateLease(raw_state, self._source, installation, max_slots)
+                self._storage = self._lease.storage
+                self._state_metadata = self._lease.metadata
+            else:
+                self._storage = StateAccess(raw_state, self._source, installation)
+                self._storage.lock()
+                self._state_metadata = {"mode": "exclusive", "persistent": True,
+                                        "cleanup": {"job_history_limit": JOB_HISTORY_LIMIT,
+                                                    "temporary_files": "reclaimed_on_slot_acquire", "exports": "manual"}}
             self.state = self._storage.path
             self.db_path = self.state / "index.sqlite"
         except Exception:
+            if self._storage is not None:
+                self._storage.close()
             self._source.close()
             raise
         self._secret = secrets.token_bytes(32)
+        self._session = threading.local()
+        self._fatal_error = None
         self._stop = threading.Event()
         self._scan_lock = threading.Lock()
         self._job_lock = threading.Lock()
@@ -122,17 +150,25 @@ class Engine:
         self._process_lock = threading.Lock()
         self._active_process = None
         self._force_jobs = set()
-        self._root_binding = hashlib.sha256(_json({"path": str(self.root), "identity": self._root_identity}).encode()).hexdigest()
-        parser_signature = hashlib.sha256(Path(__file__).with_name("extract.py").read_bytes()).hexdigest()
-        indexer_signature = hashlib.sha256(Path(__file__).read_bytes() + Path(__file__).with_name("fs_access.py").read_bytes()).hexdigest()
-        self._parse_binding = hashlib.sha256(_json({"parser": parser_signature, "indexer": indexer_signature, "limits": self.limits, "aliases": self.aliases, "schema": 3}).encode()).hexdigest()
         self._db_lock = threading.RLock()
         self._sqlite_conn = None
+        self._checkpoint_generation = None
+        self._checkpoint_at = None
         try:
-            self._storage.lock()
+            self._scratch_cleanup = self._storage.cleanup_scratch()
             self._sqlite_conn = self._storage.connect_database()
             self._sqlite_conn.row_factory = sqlite3.Row
+            try:
+                if self._sqlite_conn.execute("PRAGMA quick_check").fetchone()[0] != "ok":
+                    raise sqlite3.DatabaseError()
+            except sqlite3.DatabaseError:
+                raise DriveError("STATE_REBUILD_REQUIRED", "The index failed its integrity check.", False,
+                                 "Stop connections using this slot and reset its disposable index with the maintenance command.")
             self._init_db()
+            write_profile = getattr(self._storage, "write_profile_manifest", None)
+            if write_profile is not None:
+                write_profile()
+            self._checkpoint()
         except Exception:
             if self._sqlite_conn is not None:
                 self._sqlite_conn.close()
@@ -192,6 +228,10 @@ class Engine:
             columns = {r[1] for r in db.execute("PRAGMA table_info(files)")}
             if "format_warnings" not in columns:
                 db.execute("ALTER TABLE files ADD COLUMN format_warnings TEXT NOT NULL DEFAULT '[]'")
+            if "extraction_complete" not in columns:
+                db.execute("ALTER TABLE files ADD COLUMN extraction_complete INTEGER NOT NULL DEFAULT 1")
+            if "content_coverage" not in columns:
+                db.execute("ALTER TABLE files ADD COLUMN content_coverage TEXT NOT NULL DEFAULT '{}'")
             root_binding = db.execute("SELECT value FROM meta WHERE key='root_binding'").fetchone()
             if root_binding and root_binding[0] != self._root_binding:
                 raise DriveError("STATE_ROOT_MISMATCH", "This state directory belongs to a different source root.", False, "Choose a new empty state directory for the new source root.")
@@ -205,9 +245,13 @@ class Engine:
                 self._bump(db)
             db.execute("INSERT INTO meta(key,value) VALUES('parse_binding',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (self._parse_binding,))
             db.execute("UPDATE jobs SET status='interrupted',finished_at=? WHERE status IN ('queued','running')", (time.time(),))
-        # Prior temporary directories are deliberately not recursively cleaned here.
-        # A user may have replaced their contents or redirected a child directory;
-        # automatic startup cleanup must never traverse such objects.
+            self._prune_jobs(db)
+
+    @staticmethod
+    def _prune_jobs(db):
+        db.execute("DELETE FROM jobs WHERE status NOT IN ('queued','running') AND id NOT IN "
+                   "(SELECT id FROM jobs WHERE status NOT IN ('queued','running') "
+                   "ORDER BY created_at DESC,id DESC LIMIT ?)", (JOB_HISTORY_LIMIT,))
 
     @staticmethod
     def _bump(db):
@@ -221,9 +265,12 @@ class Engine:
         counts = {row["status"]: row["n"] for row in db.execute("SELECT status,COUNT(*) n FROM files GROUP BY status")}
         present = sum(n for s, n in counts.items() if s != "deleted")
         inventory = db.execute("SELECT value FROM meta WHERE key='inventory_complete'").fetchone()[0] == "true"
+        partial = db.execute("SELECT COUNT(*) FROM files WHERE status='ready' AND extraction_complete=0").fetchone()[0]
         return {"inventory_complete": inventory, "present_files": present,
                 "indexed_files": counts.get("ready", 0), "states": counts,
                 "all_present_files_indexed": inventory and present == counts.get("ready", 0),
+                "partial_files": partial,
+                "all_present_files_extracted_completely": inventory and present == counts.get("ready", 0) and partial == 0,
                 "scope": "Configured local root; content freshness is revalidated before evidence reads.",
                 "business_completeness": "not_established"}
 
@@ -233,12 +280,14 @@ class Engine:
                 "source_version": row["source_version"], "status": row["status"],
                 "segments_count": row["segments_count"],
                 "format_warnings": json.loads(row["format_warnings"]),
+                "extraction_complete": row["status"] == "ready" and bool(row["extraction_complete"]),
+                "content_coverage": json.loads(row["content_coverage"]),
                 "error": ({"code": row["error_code"], "message": row["error_message"]}
                           if row["error_code"] else None)}
 
     @staticmethod
     def _prefix(prefix):
-        if not isinstance(prefix, str) or len(prefix) > 4096 or "\\" in prefix or "\x00" in prefix:
+        if not isinstance(prefix, str) or len(prefix) > MAX_PREFIX_CHARS or "\\" in prefix or "\x00" in prefix:
             raise DriveError("INVALID_PATH", "Use a relative path within the configured root.")
         p = PurePosixPath(prefix)
         if p.is_absolute() or ".." in p.parts:
@@ -252,22 +301,30 @@ class Engine:
         return limit
 
     def _cursor(self, binding, offset):
-        raw = _json({"binding": binding, "offset": offset}).encode()
-        signature = hmac.new(self._secret, raw, hashlib.sha256).digest()
+        raw = _json({"binding": self._binding_digest(binding), "offset": offset}).encode()
+        signature = hmac.new(self._cursor_key(), raw, hashlib.sha256).digest()
         return base64.urlsafe_b64encode(signature + raw).decode().rstrip("=")
+
+    @staticmethod
+    def _binding_digest(binding):
+        return hashlib.sha256(json.dumps(binding, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+    def _cursor_key(self):
+        session = getattr(self._session, "session_id", "")
+        return hmac.new(self._secret, session.encode("utf-8"), hashlib.sha256).digest()
 
     def _offset(self, cursor, binding):
         if cursor is None:
             return 0
         try:
-            if not isinstance(cursor, str) or len(cursor) > 4096:
+            if not isinstance(cursor, str) or len(cursor) > MAX_CURSOR_CHARS:
                 raise ValueError()
             decoded = base64.urlsafe_b64decode(cursor + "=" * (-len(cursor) % 4))
             sig, raw = decoded[:32], decoded[32:]
             obj = json.loads(raw)
-            if not hmac.compare_digest(sig, hmac.new(self._secret, raw, hashlib.sha256).digest()):
+            if not hmac.compare_digest(sig, hmac.new(self._cursor_key(), raw, hashlib.sha256).digest()):
                 raise ValueError()
-            if obj["binding"] != binding:
+            if obj["binding"] != self._binding_digest(binding):
                 raise DriveError("STALE_CURSOR", "The query, index generation, or source version has changed.", True, "Restart pagination without a cursor.")
             offset = obj["offset"]
             if isinstance(offset, bool) or not isinstance(offset, int) or offset < 0:
@@ -279,6 +336,7 @@ class Engine:
             raise DriveError("INVALID_CURSOR", "The cursor is invalid or belongs to another server session.", True, "Restart pagination without a cursor.")
 
     def status(self):
+        self._check_health()
         self._check_root()
         with self._db() as db:
             return {"ok": True, "provider": "local", "index_generation": self._generation(db),
@@ -286,6 +344,13 @@ class Engine:
                     "last_scan_at": json.loads(db.execute("SELECT value FROM meta WHERE key='last_scan_at'").fetchone()[0]),
                     "update_mode": "startup_and_periodic_polling_while_server_runs",
                     "poll_seconds": self.poll_seconds,
+                    "state_storage": dict(self._state_metadata, last_scratch_cleanup=self._scratch_cleanup,
+                                          recovery=getattr(self._storage, "recovery", {}),
+                                          durable_index_generation=self._checkpoint_generation,
+                                          checkpoint_at=self._checkpoint_at),
+                    "source_id": self._root_binding,
+                    "indexer_health": "healthy" if self._thread is not None else "manual",
+                    "current_job_id": self._pending_job,
                     "search_mode": "keyword_with_configured_aliases_not_semantic",
                     "freshness": "Metadata checked during scans; full digest checked for inspect/read/export.",
                     "network_calls": False, "read_only_sources": True}
@@ -324,43 +389,78 @@ class Engine:
         return {"ok": True, "job_id": job_id, "status": result["job"]["status"]}
 
     def _run(self):
-        while not self._stop.is_set():
-            try:
-                job_id = self._queue.get(timeout=self.poll_seconds)
-            except queue.Empty:
-                if not self._stop.is_set():
-                    try:
-                        self.refresh()
-                    except DriveError:
-                        # A missing/rebound root must not terminate the protocol worker.
-                        # Public status/read calls return the precise source error.
-                        pass
-                continue
-            if job_id is None:
-                break
-            try:
-                self.scan_once(job_id)
-            except Exception as exc:
-                with self._db() as db:
-                    code = exc.code if isinstance(exc, DriveError) else "SCAN_FAILED"
-                    db.execute("UPDATE jobs SET status='failed',error_code=?,finished_at=? WHERE id=?", (code, time.time(), job_id))
-            finally:
-                with self._job_lock:
-                    if self._pending_job == job_id:
-                        self._pending_job = None
-                self._cancelled.discard(job_id)
-                self._force_jobs.discard(job_id)
-                self._queue.task_done()
-        self._release_state_lock()
+        try:
+            while not self._stop.is_set():
+                try:
+                    job_id = self._queue.get(timeout=self.poll_seconds)
+                except queue.Empty:
+                    if not self._stop.is_set():
+                        try:
+                            self.refresh()
+                        except DriveError as exc:
+                            if exc.code.startswith(("STATE_", "INDEXER_")):
+                                raise
+                            # Missing/rebound sources remain visible to status/read.
+                    continue
+                if job_id is None:
+                    break
+                try:
+                    self.scan_once(job_id)
+                except Exception as exc:
+                    with self._db() as db:
+                        code = exc.code if isinstance(exc, DriveError) else "SCAN_FAILED"
+                        db.execute("UPDATE jobs SET status='failed',error_code=?,finished_at=? WHERE id=?", (code, time.time(), job_id))
+                        self._prune_jobs(db)
+                    if isinstance(exc, sqlite3.Error) or (isinstance(exc, DriveError) and exc.code.startswith("STATE_")):
+                        raise
+                finally:
+                    with self._job_lock:
+                        if self._pending_job == job_id:
+                            self._pending_job = None
+                    self._cancelled.discard(job_id)
+                    self._force_jobs.discard(job_id)
+                    self._queue.task_done()
+        except Exception as exc:
+            self._fatal_error = exc.code if isinstance(exc, DriveError) else "INDEX_STORAGE_FAILED"
+            self._stop.set()
+        finally:
+            self._release_state_lock()
+
+    def _check_health(self):
+        if self._fatal_error is not None:
+            raise DriveError("INDEXER_UNHEALTHY", "The index worker stopped after a storage or internal failure.", True,
+                             "Retry to restart the index service; if it recurs, check available disk space and service diagnostics.")
+
+    def _checkpoint(self, force=False):
+        with self._db_lock:
+            if self._sqlite_conn is not None:
+                generation = self._generation(self._sqlite_conn)
+                if not force and self._checkpoint_generation == generation:
+                    return
+                checkpoint = getattr(self._storage, "checkpoint_database", None)
+                if checkpoint is not None:
+                    checkpoint(self._sqlite_conn)
+                    self._checkpoint_generation = generation
+                    self._checkpoint_at = self._utc_now()
 
     def _release_state_lock(self):
         with self._db_lock:
-            if self._sqlite_conn is not None:
-                self._sqlite_conn.close()
-                self._sqlite_conn = None
-        if self._storage is not None:
-            self._storage.close()
-        self._source.close()
+            try:
+                if self._sqlite_conn is not None and self._fatal_error is None:
+                    self._checkpoint(force=True)
+            except Exception:
+                self._fatal_error = "STATE_CHECKPOINT_FAILED"
+            finally:
+                try:
+                    if self._sqlite_conn is not None:
+                        self._sqlite_conn.close()
+                        self._sqlite_conn = None
+                finally:
+                    try:
+                        if self._storage is not None:
+                            self._storage.close()
+                    finally:
+                        self._source.close()
 
     def close(self):
         self._stop.set()
@@ -376,6 +476,7 @@ class Engine:
             self._release_state_lock()
 
     def _check_root(self):
+        self._check_health()
         self._source.check_root()
         self._storage.check()
 
@@ -418,12 +519,17 @@ class Engine:
             raise DriveError("SOURCE_CHANGED", "The source pathname changed during reading.", True, "Refresh and retry.")
         return digest.hexdigest(), before
 
-    def _invalidate(self, file_id, code, message, status="stale"):
+    def _invalidate(self, file_id, code, message, status="stale", expected_version=None):
         with self._db() as db:
+            current = db.execute("SELECT path,source_version,status FROM files WHERE id=?", (file_id,)).fetchone()
+            if current is None or (expected_version is not None and current["source_version"] != expected_version):
+                return
             db.execute("UPDATE files SET status=?,error_code=?,error_message=?,segments_count=0,updated_at=? WHERE id=?", (status, code, message, time.time(), file_id))
             db.execute("DELETE FROM segments WHERE file_id=?", (file_id,))
             db.execute("DELETE FROM structure WHERE file_id=?", (file_id,))
             db.execute("DELETE FROM search_index WHERE file_id=?", (file_id,))
+            if current["status"] != "deleted":
+                db.execute("INSERT INTO search_index(tokens,file_id,ordinal) VALUES(?,?,-1)", (" ".join(tokenize(current["path"])), file_id))
             self._bump(db)
 
     def _validated(self, file_id, expected_version=None):
@@ -439,10 +545,10 @@ class Engine:
         try:
             version, _ = self._digest(row["path"])
         except DriveError as exc:
-            self._invalidate(file_id, exc.code, exc.message)
+            self._invalidate(file_id, exc.code, exc.message, expected_version=row["source_version"])
             raise
         if version != row["source_version"]:
-            self._invalidate(file_id, "STALE_SOURCE", "Source content differs from the indexed version.")
+            self._invalidate(file_id, "STALE_SOURCE", "Source content differs from the indexed version.", expected_version=row["source_version"])
             raise DriveError("STALE_SOURCE", "Source content differs from the indexed version.", True, "Refresh and wait for the file to be indexed again.")
         return row
 
@@ -478,9 +584,9 @@ class Engine:
                     "coverage": self._coverage(db), "freshness": "inventory_metadata"}
         return self._page(base, "files", [self._file_out(row) for row in rows], limit, offset, total, binding)
 
-    def _search_expression(self, query):
-        if not isinstance(query, str) or not query.strip() or len(query) > 512:
-            raise DriveError("INVALID_QUERY", "query must contain 1 to 512 characters.")
+    def _search_groups(self, query):
+        if not isinstance(query, str) or not query.strip() or len(query) > MAX_QUERY_CHARS:
+            raise DriveError("INVALID_QUERY", "query must contain 1 to 500 characters.")
         variants = {query}
         for key, values in self.aliases.items():
             group = [key] + values
@@ -492,29 +598,51 @@ class Engine:
         groups = []
         for variant in sorted(variants):
             tokens = query_tokens(variant)
-            if tokens:
-                groups.append("(" + " AND ".join('"' + token + '"' for token in tokens) + ")")
+            if tokens and tokens not in groups:
+                groups.append(tokens)
         if not groups:
             raise DriveError("INVALID_QUERY", "Use Chinese, Latin words, or numeric identifiers.")
-        return " OR ".join(groups)
+        if sum(len(group) for group in groups) > 256:
+            raise DriveError("QUERY_TOO_BROAD", "The query has too many keyword terms or alias combinations.", False,
+                             "Use a shorter query or fewer alias combinations.")
+        return groups
+
+    def _search_expression(self, query):
+        return " OR ".join("(" + " AND ".join('"' + token + '"' for token in group) + ")"
+                           for group in self._search_groups(query))
 
     def search(self, query, prefix="", limit=10, cursor=None):
         self._check_root()
         prefix, limit = self._prefix(prefix), self._limit(limit)
-        expression = self._search_expression(query)
+        groups = self._search_groups(query)
+        expression = " OR ".join("(" + " AND ".join('"' + token + '"' for token in group) + ")" for group in groups)
+        any_terms = " OR ".join('"' + token + '"' for token in sorted({token for group in groups for token in group}))
+        ctes, search_args = [], []
+        for index, group in enumerate(groups):
+            ctes.append("v%d AS (%s)" % (index, " INTERSECT ".join(
+                "SELECT file_id FROM search_index WHERE search_index MATCH ?" for _ in group)))
+            search_args.extend('"' + token + '"' for token in group)
+        ctes.append("candidates AS (" + " UNION ".join("SELECT file_id FROM v%d" % i for i in range(len(groups))) + ")")
+        ctes.append("dense AS (SELECT file_id,MIN(CAST(ordinal AS INTEGER)) ordinal FROM search_index WHERE search_index MATCH ? GROUP BY file_id)")
+        ctes.append("hits AS (SELECT file_id,MIN(CASE WHEN CAST(ordinal AS INTEGER)>=0 THEN CAST(ordinal AS INTEGER) END) ordinal FROM search_index WHERE search_index MATCH ? GROUP BY file_id)")
+        search_args.extend([expression, any_terms])
+        cte = "WITH " + ",".join(ctes) + " "
         with self._db() as db:
             db.execute("BEGIN")
             generation = self._generation(db)
             binding = {"method": "search", "query": query, "prefix": prefix, "generation": generation}
             offset = self._offset(cursor, binding)
-            clause, args = "f.status!='deleted'", [expression]
+            clause, args = "f.status!='deleted'", list(search_args)
             if prefix:
                 clause += " AND (f.path=? OR substr(f.path,1,?)=?)"
                 args.extend([prefix, len(prefix) + 1, prefix + "/"])
-            cte = "WITH hits AS (SELECT file_id,MIN(CAST(ordinal AS INTEGER)) ordinal FROM search_index WHERE search_index MATCH ? GROUP BY file_id) "
-            join = "FROM files f JOIN hits h ON f.id=h.file_id WHERE " + clause
+            join = "FROM files f JOIN candidates c ON f.id=c.file_id LEFT JOIN dense d ON f.id=d.file_id LEFT JOIN hits h ON f.id=h.file_id WHERE " + clause
             total = db.execute(cte + "SELECT COUNT(*) " + join, args).fetchone()[0]
-            rows = db.execute(cte + "SELECT f.*,h.ordinal " + join + " ORDER BY f.path LIMIT ? OFFSET ?", args + [limit, offset]).fetchall()
+            # Exact path phrase, all terms in a path, and all terms in one content
+            # segment rank ahead of cross-segment matches. Path breaks ties stably.
+            score = "(CASE WHEN instr(lower(f.path),?)>0 THEN 100 ELSE 0 END + CASE WHEN d.ordinal=-1 THEN 30 WHEN d.ordinal>=0 THEN 20 ELSE 0 END)"
+            rows = db.execute(cte + "SELECT f.*,COALESCE(d.ordinal,h.ordinal,-1) ordinal,CASE WHEN d.file_id IS NULL THEN 1 ELSE 0 END across_segments," + score + " relevance " + join +
+                              " ORDER BY relevance DESC,f.path LIMIT ? OFFSET ?", search_args + [query.casefold()] + args[len(search_args):] + [limit, offset]).fetchall()
             files = []
             for row in rows:
                 item = self._file_out(row)
@@ -523,11 +651,14 @@ class Engine:
                 item["match"] = {"kind": "content" if payload else "path", "ordinal": row["ordinal"],
                                  "locator": payload.get("locator") if payload else None,
                                  "snippet": payload.get("text", "")[:600] if payload else row["path"],
-                                 "snippet_is_evidence": False}
+                                 "snippet_is_evidence": False,
+                                 "terms_matched_across_segments": bool(row["across_segments"]),
+                                 "relevance_score": row["relevance"]}
                 files.append(item)
             base = {"ok": True, "index_generation": generation, "query": query,
                     "total_matching_files": total, "coverage": self._coverage(db),
-                    "mode": "keyword_candidates", "order": "path",
+                    "mode": "file_level_keyword_candidates", "order": "relevance_then_path",
+                    "matching_scope": "Each alias alternative requires all its terms somewhere in the same file's path or extracted text.",
                     "freshness": "indexed_not_revalidated", "exhaustive_for_business_totals": False,
                     "next_action": "Inspect and read matching sources before answering; keyword matches do not establish a complete business dataset."}
         return self._page(base, "files", files, limit, offset, total, binding)
@@ -606,7 +737,8 @@ class Engine:
             raise DriveError("INDEX_CHANGED", "The index changed during this read.", True, "Inspect and restart the read.")
         base = {"ok": True, "file_id": file_id, "path": row["path"], "source_version": row["source_version"],
                 "total_segments": total, "start": offset, "freshness": "digest_verified_at_read_start",
-                "extraction_complete": True, "format_warnings": json.loads(row["format_warnings"]),
+                "extraction_complete": bool(row["extraction_complete"]), "format_warnings": json.loads(row["format_warnings"]),
+                "content_coverage": json.loads(row["content_coverage"]),
                 "extraction_scope": "Supported extracted content; see format_warnings for omitted content.",
                 "selector": selector, "selection_scope": "filtered_segments" if selector else "whole_file_segments",
                 "total_matching_segments": matched,
@@ -645,19 +777,101 @@ class Engine:
         return {"ok": True, "artifact_id": artifact_id, "artifact_path": str(path),
                 "artifact_path_scope": "Local runtime path for analysis tools; do not publish runtime traces or exports.",
                 "format": "jsonl", "row_count": count,
-                "source_version": expected_version, "extraction_complete": True,
+                "source_version": expected_version, "extraction_complete": bool(row["extraction_complete"]),
+                "content_coverage": json.loads(row["content_coverage"]),
                 "format_warnings": json.loads(row["format_warnings"]),
                 "business_completeness": "not_established", "includes_original_binary": False}
 
-    def call(self, method, params=None):
-        methods = {name: getattr(self, name) for name in ("status", "refresh", "job_status", "cancel", "list", "search", "inspect", "read", "export")}
-        if method not in methods:
+    @staticmethod
+    def _utc_now():
+        return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+    def evidence_bundle(self, files, scope_description=""):
+        """Export exactly the selected versions with a durable, explicit gap manifest."""
+        if not isinstance(files, list) or not 1 <= len(files) <= 50:
+            raise DriveError("INVALID_PARAMS", "files must contain between 1 and 50 explicit file selections.")
+        if not isinstance(scope_description, str) or len(scope_description) > 2000:
+            raise DriveError("INVALID_PARAMS", "scope_description must contain at most 2000 characters.")
+        seen = set()
+        for item in files:
+            if not isinstance(item, dict) or set(item) != {"file_id", "expected_version"}:
+                raise DriveError("INVALID_PARAMS", "Each selection must contain only file_id and expected_version.")
+            if not isinstance(item["file_id"], str) or not 1 <= len(item["file_id"]) <= 128:
+                raise DriveError("INVALID_PARAMS", "Each file_id must be a nonempty identifier of at most 128 characters.")
+            if not isinstance(item["expected_version"], str) or not 1 <= len(item["expected_version"]) <= 256:
+                raise DriveError("EXPECTED_VERSION_REQUIRED", "Every selected file requires its expected source version.")
+            if item["file_id"] in seen:
+                raise DriveError("INVALID_PARAMS", "Select each file only once.")
+            seen.add(item["file_id"])
+        self._check_root()
+        started = self._utc_now()
+        entries = []
+        for item in files:
+            entry = dict(item, observed_at=self._utc_now(), status="failed")
+            try:
+                inspected = self.inspect(item["file_id"], limit=1)
+                entry.update(path=inspected["file"]["path"], observed_version=inspected["source_version"])
+                exported = self.export(item["file_id"], item["expected_version"])
+                entry.update(status="exported", source_version=exported["source_version"],
+                             artifact_id=exported["artifact_id"], artifact_path=exported["artifact_path"],
+                             segment_count=exported["row_count"], extraction_complete=exported["extraction_complete"],
+                             content_coverage=exported["content_coverage"], format_warnings=exported["format_warnings"],
+                             exported_at=self._utc_now())
+            except DriveError as exc:
+                entry["error"] = failure(exc.code, exc.message, exc.retryable, exc.next_action)["error"]
+            entries.append(entry)
+        exported_count = sum(entry["status"] == "exported" for entry in entries)
+        complete_count = sum(entry.get("extraction_complete", False) for entry in entries)
+        manifest = {
+            "schema": "df-mcp-evidence-bundle-v1", "created_at": self._utc_now(),
+            "source": {"provider": "local", "root": str(self.root), "source_id": self._root_binding,
+                       "root_identity": list(self._root_identity)},
+            "scope": {"selection": "exactly_explicit_file_ids", "description": scope_description,
+                      "description_authority": "user_supplied_not_verified", "requested_files": len(files)},
+            "observation_interval": {"started_at": started, "ended_at": self._utc_now()},
+            "snapshot_semantics": "Sequential version-pinned reads; not an atomic snapshot of the folder.",
+            "exported_files": exported_count, "failed_files": len(files) - exported_count,
+            "all_selected_versions_exported": exported_count == len(files),
+            "all_selected_text_complete": complete_count == len(files),
+            "business_completeness": "not_established", "files": entries,
+            "gaps": [{"file_id": entry["file_id"], "error": entry.get("error"),
+                      "content_coverage": entry.get("content_coverage", {})}
+                     for entry in entries if entry["status"] != "exported" or not entry.get("extraction_complete", False)],
+            "interpretation": "Exports contain supported extracted segments, including explicit gaps. Review per-file format warnings; no calculations or business completeness are asserted."
+        }
+        artifact_id = "bundles/" + uuid.uuid4().hex + ".json"
+        with self._storage.directory("bundles", create=True) as folder:
+            path = folder / PurePosixPath(artifact_id).name
+            try:
+                with self._storage.new_private(path) as output:
+                    output.write(json.dumps(manifest, ensure_ascii=False, indent=2, allow_nan=False) + "\n")
+            except Exception:
+                self._storage.unlink_private(path)
+                raise
+        return {"ok": True, "artifact_id": artifact_id, "artifact_path": str(path),
+                "artifact_path_scope": "Local evidence manifest; contains source paths and must not be published without review.",
+                "requested_files": len(files), "exported_files": exported_count, "failed_files": len(files) - exported_count,
+                "all_selected_versions_exported": exported_count == len(files),
+                "all_selected_text_complete": complete_count == len(files),
+                "business_completeness": "not_established", "observation_interval": manifest["observation_interval"],
+                "files": [{"file_id": entry["file_id"], "status": entry["status"],
+                           "error_code": entry.get("error", {}).get("code"),
+                           "extraction_complete": entry.get("extraction_complete", False)} for entry in entries]}
+
+    def call(self, method, params=None, session_id=None):
+        methods = {name: getattr(self, name) for name in ("status", "refresh", "job_status", "cancel", "list", "search", "inspect", "read", "export", "evidence_bundle")}
+        if not isinstance(method, str) or method not in methods:
             return failure("UNKNOWN_METHOD", "The requested method is not supported.")
         if params is None:
             params = {}
         if not isinstance(params, dict):
             return failure("INVALID_PARAMS", "params must be an object.")
+        if session_id is not None and (not isinstance(session_id, str) or not 1 <= len(session_id) <= 256):
+            return failure("INVALID_SESSION", "The service session identifier is invalid.")
+        previous_session = getattr(self._session, "session_id", "")
+        self._session.session_id = session_id or ""
         try:
+            self._check_health()
             result = methods[method](**params)
             if len(_json(result).encode()) > MAX_RESPONSE_BYTES:
                 return failure("RESPONSE_TOO_LARGE", "The response exceeds the bounded output size.", False, "Narrow the query or reduce the page size.")
@@ -668,6 +882,8 @@ class Engine:
             return failure("INVALID_PARAMS", "Parameters do not match this tool's input schema.")
         except Exception:
             return failure("INTERNAL_ERROR", "The operation could not complete.", True, "Check local service health; no source content was modified.")
+        finally:
+            self._session.session_id = previous_session
 
     def scan_once(self, job_id=None, force=False):
         """Synchronous scan used by the worker thread and deterministic tests."""
@@ -698,9 +914,13 @@ class Engine:
                           "unsupported": ("UNSUPPORTED_FORMAT", "This file format is not supported.")}.get(initial, (None, None))
                 with self._db() as db:
                     old = db.execute("SELECT * FROM files WHERE id=?", (file_id,)).fetchone()
-                    unchanged = (old is not None and old["size"] == info.st_size and
+                    stable_state = old is not None and (
+                        (initial == "pending" and old["status"] in ("ready", "failed")) or
+                        (initial != "pending" and old["status"] == initial and
+                         old["error_code"] == reason[0] and old["error_message"] == reason[1]))
+                    unchanged = (stable_state and old["size"] == info.st_size and
                                  old["mtime_ns"] == info.st_mtime_ns and old["ctime_ns"] == info.st_ctime_ns and
-                                 old["status"] in ("ready", "failed") and initial == "pending" and not force)
+                                 not force)
                     if unchanged:
                         db.execute("UPDATE files SET seen_scan=? WHERE id=?", (scan_id, file_id))
                     else:
@@ -741,6 +961,9 @@ class Engine:
             with self._db() as db:
                 db.execute("UPDATE jobs SET status=?,finished_at=?,error_code=? WHERE id=?", ("cancelled" if cancelled else "complete" if complete else "failed", time.time(), None if complete else "INVENTORY_INCOMPLETE", job_id))
                 db.execute("UPDATE meta SET value=? WHERE key='last_scan_at'", (_json(time.time()),))
+                self._prune_jobs(db)
+            if complete and not cancelled:
+                self._checkpoint()
             return self.job_status(job_id)
 
     def _parse_file(self, row):
@@ -750,7 +973,13 @@ class Engine:
                 self._parse_file_guarded(row, work_dir)
             self._storage.remove_empty_directory(name)
         except DriveError as exc:
-            self._invalidate(row["id"], exc.code, exc.message, "failed")
+            self._parse_failure(row["id"], exc.code, exc.message)
+
+    def _parse_failure(self, file_id, code, message):
+        if self._stop.is_set():
+            self._invalidate(file_id, "PARSE_INTERRUPTED", "Parsing stopped during service shutdown; it will be retried on the next scan.", "pending")
+        else:
+            self._invalidate(file_id, code, message, "failed")
 
     def _parse_file_guarded(self, row, work_dir):
         snapshot_path = None
@@ -762,7 +991,7 @@ class Engine:
             parsed_path = work_dir / ("parsed-" + uuid.uuid4().hex + ".jsonl")
             with self._storage.new_private(parsed_path):
                 pass
-            count, warnings = self._extract(snapshot_path, parsed_path)
+            count, warnings, content_coverage = self._extract(snapshot_path, parsed_path)
             current_version, current_info = self._digest(row["path"])
             if current_version != version:
                 raise DriveError("SOURCE_CHANGED", "The source changed during parsing.", True, "Wait for writing to finish, then refresh.")
@@ -783,12 +1012,13 @@ class Engine:
                     group_key, group_end = key, ordinal
                 if group_key is not None:
                     db.execute("INSERT INTO structure VALUES(?,?,?,?,?)", (row["id"], group_position, group_key, group_start, group_end))
-                db.execute("UPDATE files SET source_version=?,status='ready',error_code=NULL,error_message=NULL,segments_count=?,size=?,mtime_ns=?,ctime_ns=?,format_warnings=?,updated_at=? WHERE id=?", (version, count, current_info.st_size, current_info.st_mtime_ns, current_info.st_ctime_ns, _json(warnings), time.time(), row["id"]))
+                complete = not content_coverage.get("missing_text_pages")
+                db.execute("UPDATE files SET source_version=?,status='ready',error_code=NULL,error_message=NULL,segments_count=?,size=?,mtime_ns=?,ctime_ns=?,format_warnings=?,extraction_complete=?,content_coverage=?,updated_at=? WHERE id=?", (version, count, current_info.st_size, current_info.st_mtime_ns, current_info.st_ctime_ns, _json(warnings), int(complete), _json(content_coverage), time.time(), row["id"]))
                 self._bump(db)
         except DriveError as exc:
-            self._invalidate(row["id"], exc.code, exc.message, "failed")
+            self._parse_failure(row["id"], exc.code, exc.message)
         except Exception:
-            self._invalidate(row["id"], "PARSE_FAILED", "The file could not be parsed safely.", "failed")
+            self._parse_failure(row["id"], "PARSE_FAILED", "The file could not be parsed safely.")
         finally:
             if snapshot_path:
                 self._storage.unlink_private(snapshot_path)
@@ -827,6 +1057,7 @@ class Engine:
         timer.start()
         count, total_bytes, done = 0, 0, False
         warnings = set()
+        pages, missing_pages = set(), set()
         try:
             with self._storage.open_private(parsed_path, "w") as output:
                 while True:
@@ -854,6 +1085,12 @@ class Engine:
                         raise DriveError("SEGMENT_TOO_LARGE", "An extracted segment exceeds the response budget.", False, "Reduce source column widths or adjust segmentation.")
                     count += 1
                     warnings.update(str(value)[:200] for value in segment.get("warnings", []))
+                    if snapshot_path.suffix == ".pdf":
+                        page = segment.get("locator", {}).get("page")
+                        if isinstance(page, int):
+                            pages.add(page)
+                            if "no_extractable_text_ocr_may_be_required" in segment.get("warnings", []):
+                                missing_pages.add(page)
                     if count > self.limits["max_segments"]:
                         raise DriveError("SEGMENT_LIMIT", "The file exceeds max_segments.")
                     output.write(_json(segment) + "\n")
@@ -862,7 +1099,15 @@ class Engine:
                 raise DriveError("PARSE_TIMEOUT", "Parsing exceeded parse_timeout_seconds.", True, "Use a smaller source or deliberately adjust the timeout.")
             if code != 0 or not done:
                 raise DriveError("PARSE_FAILED", "The parser did not complete successfully.")
-            return count, sorted(warnings)
+            coverage = ({"unit": "page", "total_pages": len(pages), "pages_with_text": len(pages - missing_pages),
+                         "missing_text_pages": sorted(missing_pages)[:2000],
+                         "missing_text_page_count": len(missing_pages),
+                         "missing_text_pages_truncated": len(missing_pages) > 2000,
+                         "gap_locations_scope": "First 2000 missing pages; every gap remains a located segment in the full export.",
+                         "ocr_performed": False,
+                         "gap_interpretation": "Blank and image-only pages are not distinguished."}
+                        if snapshot_path.suffix == ".pdf" else {})
+            return count, sorted(warnings), coverage
         finally:
             timer.cancel()
             if process.poll() is None:

@@ -4,7 +4,8 @@ import json
 import signal
 import sys
 
-from .engine import DriveError, Engine, failure
+from .engine import DriveError, failure
+from .bridge import Bridge
 
 
 def main():
@@ -12,7 +13,7 @@ def main():
     parser.add_argument("--config", required=True)
     args = parser.parse_args()
     try:
-        engine = Engine(args.config)
+        engine = Bridge(args.config)
     except DriveError as exc:
         print(json.dumps({"id": None, "result": failure(exc.code, exc.message, exc.retryable, exc.next_action)}), flush=True)
         return 1
@@ -45,6 +46,8 @@ def main():
                         request_id = None
                         raise ValueError()
                     result = engine.call(request.get("method"), request.get("params", {}))
+            except DriveError as exc:
+                result = failure(exc.code, exc.message, exc.retryable, exc.next_action)
             except (ValueError, TypeError, UnicodeError):
                 result = failure("INVALID_REQUEST", "Use one JSON object with id, method, and params per line.")
             print(json.dumps({"id": request_id, "result": result}, ensure_ascii=False, separators=(",", ":"), allow_nan=False), flush=True)

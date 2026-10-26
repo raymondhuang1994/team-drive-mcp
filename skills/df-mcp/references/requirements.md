@@ -1,42 +1,29 @@
-# Operating requirements and limits
+# Operating requirements
 
-## Runtime prerequisites
+## Connected service
 
-The host must connect the local MCP server exposing `team_drive_` tools. The public project supplies a Node.js 22+ TypeScript stdio adapter and a Python 3.9+ local engine using SQLite. Supported platforms are Windows, macOS and Linux. Install the locked dependencies using the repository setup workflow. The installer asks the user to choose and confirm one source root and displays the separate local state location. Do not infer a root from the user's home directory, add a second root, or scan elsewhere when the configuration is missing. A root change requires the user to run configuration again; no MCP tool can change it.
+The local reader uses Node.js 22+ and Python 3.9+ on Windows, macOS or Linux. Source selection belongs to explicit configuration; no MCP tool can add or change a root. Use `team_drive_status` and the declared schemas to identify the connected release/capabilities, source identity, health, current job and storage mode. Do not infer a connection from the presence of this Skill.
 
-The configured root is the authorization boundary for this service. The engine refuses symlinks and path traversal. On Windows, use an ordinary folder on a fixed local drive: UNC/network/removable/device paths, junctions and other reparse paths are unsupported; multiply linked source files are rejected. Handles are opened for read access only. Windows directory handles can temporarily prevent renaming or removing an open directory; close the service before reorganizing its root. These controls apply to this service, not to unrelated host tools that might have broader permissions. The source must be readable by the operating-system account. Indexes, extracted text and exports contain source-derived information and need the same local protection as the source data.
+Release 0.3 uses lightweight stdio bridges to one managed local broker for the configured source/state. Chats share one index and scan scheduler, with separate session cursors. The broker starts on demand and exits after its last client has disconnected for the configured idle interval (default 60 seconds). Local Unix sockets or Windows named pipes are used; this is not a network or permanent operating-system service. Do not create a new state directory for every chat. Old 0.2 exclusive workers and 0.2.1 isolated pools have different behavior: diagnose the actual version before recommending recovery.
 
-Only one worker may own a state directory at a time (`STATE_IN_USE` otherwise). Different client processes need distinct state directories or must connect to one managed service. A state directory is bound to its configured root; use a new state directory when changing roots.
+Default service settings are `service.idle_seconds: 60` and `service.max_clients: 64`; these are deliberate administrator configuration, not limits to raise automatically. State is outside every `.codex` directory and `CODEX_HOME`, including physical aliases. Old root-level/pool caches are preserved until explicit maintenance; changing source uses a separate confirmed profile, not an in-place index rebind.
 
-The service scans at startup and polls while running (30 seconds by default). It does not install an operating-system file watcher or a permanent background service. A stopped or sleeping computer does not update the index. Run `team_drive_refresh` after a known change when freshness matters, and inspect its job result. Unchanged failed files are not repeatedly parsed by ordinary polling; use `force: true` after resolving the failure when retrying unchanged bytes is appropriate. A file may still change after refresh; evidence reads verify the source version separately.
+## Source and local outputs
 
-## Scope and authority
+The root is this service's authorization boundary. Sources are opened for reading, and source traversal/links are guarded. On Windows use ordinary fixed local disks: network/removable/device paths, junctions and reparse paths are unsupported. Windows handles can prevent source-directory renaming while open; stop the service before reorganizing it. The boundary does not remove write access from unrelated host tools.
 
-Before a business answer, establish the smallest directory/project/period that covers the question. An approved source registry and metric dictionary are recommended inputs for budget, report and KOL workflows. The reader does not automatically interpret or enforce such business registries.
+Indexes, snapshots, exports and evidence manifests are source-derived private data outside the root. Keep calculations and reports in separate approved output locations. Do not change source permissions, force cloud hydration or unlock another application's files. Recognized offline/recall files are excluded; Windows cloud reparse files can be excluded even when locally downloaded. An approved ordinary local copy is the supported alternative.
 
-Use explicit user scope where provided. Otherwise inspect the available sources and state reasonable assumptions. Ask only when different plausible scopes or metric definitions materially change the answer. Do not infer a file's formal status from its filename alone.
+The service scans at startup and polls while alive (default 30 seconds). A completed earlier inventory does not mean a new refresh has finished: inspect `current_job_id` and call `team_drive_job_status`. Refresh after a known change when needed. Use `force: true` after fixing an unchanged parse failure; it is not a general remedy for a deterministic limit.
 
-## Source read-only boundary
+## Diagnostics and maintenance
 
-The installer and runtime do not write probe files, modify, delete, rename, move, or change permissions inside the source. Parsing uses snapshots and temporary files outside the source. Indexes, logs and generated exports belong in the separate state directory; it must not contain the source either. Installing the program inside the selected source is also rejected. Cleanup must stay within application-owned state and installed files.
+From the installed project, `node scripts/doctor.mjs --config '<config.json>'` reads setup metadata without starting a worker, scanning sources or writing state. It reports local paths; redact them before sharing. Offline success does not prove live source access or lock health. The MCP diagnostic CLI requires explicit `--config` or `--demo`; demo means simulated data, not the user's configured corpus.
 
-This is a service boundary, not a sandbox for the entire AI host or every program running under the same user. If operating-system enforcement is required, an administrator must provide a separate restricted identity or isolated environment with read-only source access. Do not change source ACLs as part of ordinary setup or ask for write access merely to read files.
+Use maintenance only for the stated operational need and authorized scope. Preview first; apply deletes only explicitly selected derived files after lease checks. Export-age cleanup preserves bundle manifests and all exports they reference; unverified bundle references fail closed. Index reset preserves evidence artifacts. Source-identity replacement requires an explicit configuration/maintenance decision, never an automatic retry flag. Never delete lock files to evict a live service. Rebuild from sources only when the reported recovery action calls for it. A closed old MCP transport needs a fresh client connection; a configuration edit cannot revive that pipe.
 
-## Side effects
+## Scope and limits
 
-- `status`, `list`, `search`, `inspect` and `read` are source reads; indexing may be maintained by the running service.
-- `refresh` updates local index state; `export` writes a controlled, generated JSONL artifact below the state directory.
-- `job_status` observes jobs; `cancel` requests cancellation of a local indexing job at the next file boundary. The current parser may run until it completes or reaches its timeout.
-- None of these tools edits the source documents, grants access, publishes documents or uploads them.
+An approved source registry and metric dictionary help establish project/period/status, currency and deduplication. The reader does not automatically decide business authority. Use explicit user scope; ask only when unresolved plausible definitions materially change the answer.
 
-Use the runtime's current tool schemas for exact input names and bounds. Runtime errors and declared limits take precedence over examples in prose. Do not increase limits or change the root implicitly to make a request succeed.
-
-## First-version exclusions
-
-- No SharePoint/Teams/Graph login, cloud synchronization service or permission enforcement between different employees.
-- No OCR, image understanding, document rendering, macro execution, workbook recalculation, embedding model or autonomous internet search.
-- No business-specific authorization decision, advertising-platform connection, PPT generation or KOL outreach.
-- No guaranteed realtime or transactionally consistent snapshot across all source files.
-- No guarantee that an arbitrary malformed, encrypted, image-only or oversized file can be parsed.
-
-For OneDrive folders, a visible entry may be a cloud placeholder. The runtime skips recognized offline/recall files rather than hydrating them. Windows cloud reparse files may be excluded even when their content is locally available. Use an approved copy in an ordinary, nonsynchronized local folder for this release; do not promise complete OneDrive availability detection or cloud-folder support. An unreadable or sharing-locked file is a reported gap, not permission to unlock it, change its ACL, or silently use stale content.
+No SharePoint/Teams login, employee permission synchronization, OCR, image/layout understanding, macros, workbook recalculation, arbitrary SQL/code execution or guaranteed atomic cross-file snapshot. Runtime limits and format warnings take precedence over prose examples. macOS/Windows have input/output/time bounds, not Linux's additional parser address-space limit.

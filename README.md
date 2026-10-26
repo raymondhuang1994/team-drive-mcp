@@ -6,16 +6,18 @@
 - [Skill 操作规范](skills/df-mcp/SKILL.md)
 - [验证记录与限制](docs/VALIDATION.md)
 - [Windows 只读边界与可选隔离部署](docs/WINDOWS_READ_ONLY.md)
+- [Windows 临时修复迁移与并发验收](docs/WINDOWS_MIGRATION.md)
 - [10 个固定评估任务](tests/evaluation.xml)
 
 ## 已实现的范围
 
-- 本地 stdio MCP，9 个结构化工具；不调用模型 API、不访问网络。
+- 本地 stdio MCP，10 个结构化工具；不调用模型 API、不访问网络。
 - SQLite 文件清单与关键词索引，支持中文短词、项目代号及配置别名。
 - TXT、Markdown、CSV、TSV、XLSX、DOCX、PPTX、文字 PDF。
 - 启动扫描、运行期间定期增量核对、删除失效、失败记录和强制重试。
 - 分页、结构导航、原文定位、读取前 SHA256 版本校验、受控 JSONL 导出。
 - 安装时选择并确认读取目录；源文件只读，索引、日志、临时解析文件及导出与源目录分离。
+- 多个 stdio 连接共享一个受管理的本地索引服务；状态目录禁止位于 `.codex` 或 `CODEX_HOME` 下。
 - 授权根目录边界、符号链接/Windows junction 与 reparse 路径拒绝、压缩文件/XML 限制、超时、明确错误。
 
 **运行平台：Windows、macOS / Linux，Node.js >=22，Python >=3.9。** Windows 本版面向固定本地磁盘上的普通目录，支持中文及空格路径；不支持 UNC/网络映射盘、可移动盘、设备路径、junction、符号链接及其他 reparse 路径。目标为 Windows 10/11；自动测试的实际环境与结果见验证记录，不能据此宣称所有公司电脑已经验收。
@@ -48,7 +50,9 @@ Skill 安装到个人 Codex 技能目录，名称为 `df-mcp`。同名目标或�
 | macOS | `~/Library/Application Support/df-mcp` |
 | Linux | `$XDG_STATE_HOME/df-mcp`，未设置时为 `~/.local/state/df-mcp` |
 
-每个源目录使用独立的 `profiles/<root-hash>/config.json` 与 `profiles/<root-hash>/state/`。向导会输出完整配置路径。配置、正文缓存、数据库、日志和导出按源资料的敏感程度管理，不放在源目录、同步共享盘或公开 Git 仓库中。
+每个源目录使用独立的 `profiles/<root-hash>/config.json` 与 `profiles/<root-hash>/state/`。向导会输出完整配置路径。共享索引位于 `state/shared-v1/index/`，控制文件位于 `state/shared-v1/control/`；连接结束后保留已提交索引，下次连接复用。配置、正文缓存、数据库、日志和导出按源资料的敏感程度管理，不放在源目录、同步共享盘或公开 Git 仓库中。
+
+状态路径不能包含 `.codex` 目录，也不能位于自定义 `CODEX_HOME` 内。安装器和服务都检查此边界及物理路径，不能用别名、符号链接或 junction 绕过。这样 Windows 状态目录的长期句柄不会固定 Codex 的配置目录。即使默认环境变量被重定向到 Codex 目录内，配置也会拒绝，应改用明确的外部 `--state-dir`。
 
 换目录时运行 `npm run configure`，重新选择并确认，然后用向导给出的配置路径更新 MCP 连接。不会原地把旧索引绑定到新来源，也不会删除旧配置或资料。MCP 工具本身不能更改读取目录。
 
@@ -76,9 +80,27 @@ macOS / Linux：
 codex mcp add df_mcp -- node "$PWD/dist/index.js" --config '<向导输出的配置文件绝对路径>'
 ```
 
-这里的 `df_mcp` 是客户端连接名称；Skill 仍为 `$df-mcp`，工具名保留 `team_drive_` 前缀兼容现有调用。旧版本用户应先关闭旧会话，在客户端移除旧 `team_drive` 连接，再添加新连接，避免重复启动同一状态目录。其他支持 stdio 的客户端参考 [examples/mcp.json](examples/mcp.json)，替换路径占位符。启动新会话，让客户端发现 Skill 和工具。
+这里的 `df_mcp` 是客户端连接名称；Skill 仍为 `$df-mcp`，工具名保留 `team_drive_` 前缀兼容现有调用。旧版本用户应先关闭旧会话，在客户端移除旧 `team_drive` 连接，再添加新连接，避免保留重复注册。其他支持 stdio 的客户端参考 [examples/mcp.json](examples/mcp.json)，替换路径占位符。启动新会话，让客户端发现 Skill 和工具。Windows 上已经使用临时 launcher 或修改过 `dist/index.js` 的用户，按[迁移说明](docs/WINDOWS_MIGRATION.md)检查、备份并替换。
 
-同一 `state_dir` 只允许一个活跃服务进程。多窗口或多客户端应先关闭旧连接，或使用各自独立的状态配置。客户端会启动并保持 stdio 进程；不要同时手动运行另一个 `npm start`。如确需独立启动，必须明确提供 `npm start -- --config '<配置路径>'`，服务没有隐式默认源目录，也不会在协议连接中弹出选择框。
+多个 Codex 聊天使用同一份配置时，通过轻量 stdio 桥接连接同一个本地 broker，共享一个 Python 引擎、SQLite 索引和扫描调度。Mac/Linux 使用本机 Unix socket，Windows 使用 named pipe，不对外监听网络，也不安装系统服务。每个聊天有独立会话和分页游标；不能在聊天之间互换 cursor。
+
+服务按需启动，最后一个客户端断开后空闲 60 秒退出。可用 JSON `"service": {"idle_seconds": 60, "max_clients": 64}` 配置空闲时间（1–3600 秒）和客户端上限（1–256）。达到上限时按错误提示释放不用的连接并重试，不为每个聊天复制配置或索引。`state_pool` 仅保留旧独立 worker 的兼容用途，普通 MCP 不再按聊天占索引槽。
+
+`team_drive_status` 返回服务版本、source/config 身份、实例、健康状态、当前作业 ID（详见 job_status）和 `state_storage`。先看实际返回能力，不能凭 Skill 文件推定已连接新版。多个客户端共享刷新/取消作业：取消会影响同一来源其他会话；只有任务确实不再需要时才取消。配置在服务运行中发生变化时，按提示关闭相关连接并等待服务退出后重新连接，不混用配置。
+
+修改启动入口后需重新连接旧聊天；已关闭的 stdio 管道不会被修改配置复活。手动 `npm start -- --config '<配置路径>'` 也只是一个桥接客户端。服务没有隐式源目录，不在协议会话中弹出目录选择框。
+
+### 诊断当前连接
+
+```sh
+node scripts/doctor.mjs --config '<配置路径>'
+node scripts/call-tool.mjs team_drive_status --config '<配置路径>'
+node scripts/call-tool.mjs tools --config '<配置路径>'
+```
+
+`doctor` 仅离线读取指定配置、源码/构建版本与路径状态，不启动 worker、不扫描源文件、不创建或修复状态；其成功不能代替实时状态检查。它显示本机路径，分享前需脱敏。`call-tool` 明确连接指定配置；只有显式 `--demo` 才使用虚构样本，不会默认把模拟库当成用户资料库。status 立即返回，普通读取等待初次索引最多 60 秒；大库使用持久客户端观察进度。
+
+Mac 升级时先用原连接的配置运行 doctor，核对实际来源和版本。若原连接使用仓库虚构示例，可继续保留同一示例配置；升级服务不会自动切换到真实资料或新根目录。源码副本、构建结果与 Codex 启动入口是三个不同位置，只有重新连接后的 status 才能确认实际运行版本。
 
 示例请求：
 
@@ -88,17 +110,20 @@ codex mcp add df_mcp -- node "$PWD/dist/index.js" --config '<向导输出的配�
 
 AI 应先检查索引状态，区分正式资料与草稿，读取证据，再用确定性程序计算。搜索结果不能证明业务数据完整。
 
-### 从 0.1 升级或重建缓存
+### 升级、恢复与磁盘维护
 
-0.2 加强了源目录身份绑定与数据库文件安全检查，不直接复用 0.1 的 WAL 索引。出现 `STATE_REBUILD_REQUIRED`、`STATE_ROOT_MISMATCH` 或异常中断后的数据库错误时，先关闭旧 MCP 会话，再运行配置向导并指定**新的状态基目录**：
+0.3 从受管理源码构建服务，不直接导入 0.1/0.2 根层索引或 0.2.1 的 `pool-v1/`。这些旧缓存保留，首次启动共享索引会重建一次，随后所有聊天复用。来源身份不变、已有外部配置可继续使用；重新运行 configure 会按根目录/状态绑定复用配置，并原样保留自定义选项和键顺序。改变来源需要明确选择/确认并生成独立 profile，不会覆盖旧来源绑定。
 
-```powershell
-npm run configure -- --root 'D:\团队资料' --state-dir 'D:\df-mcp-state-v02' --yes
+共享服务使用磁盘工作数据库和已提交检查点。启动从已提交版本恢复；每次提交采用受控临时快照和原子替换，工作文件中断不会被当成新的完整版本。证据读取仍重新校验源 hash。索引是可重建缓存，不能取代源资料备份，也不能把进程强杀测试理解为所有磁盘故障/断电场景已验证。
+
+稳定运行保留已提交库和工作库，提交时另需一个临时快照；若有损坏快照，至多另留一份隔离副本。因此应按最多约 3 份完整索引、含隔离副本时约 4 份预留空间；这是单个共享服务的空间预算，不随聊天数增加。已结束作业最多保留 100 条。解析临时文件只在独占租约下按受控规则回收，不递归删除未知内容。
+
+```sh
+node scripts/maintain-state.mjs --config '<配置路径>' --prune-exports-days 30
+node scripts/maintain-state.mjs --config '<配置路径>' --prune-exports-days 30 --apply
 ```
 
-用新输出的配置路径更新 MCP 连接，让服务重新索引。仅对同一来源重复 `configure` 会找到原 profile，不能代替新状态目录；旧配置和缓存会保留，不自动删除。这里的 `D:` 路径是示例，应替换为本机允许的普通本地目录。
-
-索引是可重建缓存，不是资料备份。0.2 使用单个持久 SQLite 连接、锁串行化访问及内存回滚日志，避免创建 WAL、SHM 或磁盘回滚日志旁文件；异常退出或断电可能使索引损坏，此时使用新状态目录重建。源文件仍保持只读。中断后遗留的临时文件不递归自动清理，确认旧服务已停止后可按本机维护流程处理旧状态目录。
+维护默认预览，`--apply` 才删除选中的派生文件；`--reset-index` 可明确重建已提交/工作/临时/隔离数据库，保留导出、依据包和未知文件。来源目录身份确已更换时，只有明确的 `--reset-index --accept-source-replacement` 才接受新身份；不要为绕过错误自动加此参数。它获取与服务相同的租约并跳过忙状态。完成全量维护前关闭相关连接、等待 broker 空闲退出；不删除锁文件来强制释放服务。导出保留期只清理未被依据包引用的独立 JSONL；依据包清单及其引用的导出长期保留，不自动到期。无法核实清单引用时拒绝清理（BUNDLE_REFERENCES_UNVERIFIED）。旧缓存/profile 需核对后单独处理，源目录永远不属于清理范围。Windows 迁移及实机验收见[迁移说明](docs/WINDOWS_MIGRATION.md)。
 
 ### 只读的含义
 
@@ -116,7 +141,10 @@ Windows 不支持直接读取 OneDrive cloud reparse 文件：即使已经下载
 npm run setup -- --skip-config
 npm test
 npm run test:installer
+npm run test:doctor
+npm run test:backend
 npm run test:mcp
+npm run test:concurrency
 ```
 
 测试使用隔离临时目录和虚构资料。`--skip-config` 只跳过目录配置，不创建可用的个人读取连接。已有依赖和编译结果时可直接运行测试。
@@ -132,16 +160,17 @@ npm run test:mcp
 | `team_drive_search` | 按名称与正文关键词发现候选；结果须回查 |
 | `team_drive_inspect` | 校验版本，分页导航章节/工作表/页面结构 |
 | `team_drive_read` | 按工作表/行范围/PDF页/幻灯片筛选分段，支持版本锁定与续读 |
-| `team_drive_export` | 将指定版本全部已解析片段导出到受控 JSONL |
+| `team_drive_export` | 将指定版本已提取片段导出到受控 JSONL，保留提取缺口 |
+| `team_drive_evidence_bundle` | 将指定文件版本汇集为依据包，返回来源清单、导出、观察时间窗与缺口 |
 | `team_drive_refresh` | 排队增量更新；`force=true` 重试并重建 |
 | `team_drive_job_status` | 查看更新任务与失败情况 |
 | `team_drive_cancel` | 请求在安全文件边界取消更新 |
 
-`inventory_complete` 是本次目录盘点完成；`all_present_files_indexed` 是盘点内文件均已解析；`extraction_complete` 是该解析器完成支持内容的提取。它们**都不表示业务资料齐全或视觉内容全部理解**。必须查看 `format_warnings`。当前部分解析失败的文件不会提供成功正文，避免缺失内容被误当完整证据。
+`inventory_complete` 是本次目录盘点完成；`all_present_files_indexed` 是盘点内文件均为 ready（可包含部分提取）；`all_present_files_extracted_completely` 才同时要求没有文本提取缺口；`extraction_complete` 是该解析器完成支持内容的提取。它们**都不表示业务资料齐全或视觉内容全部理解**。必须查看 `format_warnings`。致命解析失败不提供成功正文；可明确划定的部分 PDF 提取会保留可读页并标出缺口，不能作为完整文件证据。
 
 Excel 公式与保存值分开返回；保存值可能过期，没有自动重算。Word 页码不稳定，使用段落/表格引用。PPT 图形、PDF 复杂表格、扫描件等存在明确边界。完整限制见 [formats.md](skills/df-mcp/references/formats.md)。
 
-完整汇总应先确定权威来源和业务范围，分页列出并处理全部相关文件，检查遗漏与版本，再使用导出资料和确定性代码计算。导出是服务状态目录中的 JSONL，不是原始二进制文件。`artifact_path` 是运行时返回给本地分析工具的绝对路径，不能将含该路径的完整工具轨迹直接公开发布。
+完整汇总应先确定权威来源和业务范围，分页列出并处理全部相关文件，检查遗漏与版本，再用 evidence_bundle 保存文件清单、版本化导出和缺口，用确定性代码计算。依据包生成成功不代表输入总体完整或业务口径已批准。导出是服务状态目录中的 JSONL，不是原始二进制文件。`artifact_path` 是运行时返回给本地分析工具的绝对路径，不能将含该路径的完整工具轨迹直接公开发布。
 
 ## 更新、限制和性能
 

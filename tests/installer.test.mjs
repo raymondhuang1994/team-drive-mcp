@@ -39,6 +39,8 @@ test('explicit source with Chinese/spaces creates only private configuration, ne
   assert.deepEqual(readFileSync(join(f.source, '预算.txt')), original);
   assert.match(r.getOutput(), /READ ONLY/);
   assert.match(r.getOutput(), /codex mcp add df_mcp/);
+  assert.match(r.getOutput(), /share one managed local index/);
+  assert.doesNotMatch(r.getOutput(), /Do not start two MCP connections/);
 });
 
 test('blank manual selection cancels without configuration or validation', async (t) => {
@@ -93,13 +95,74 @@ test('linked source and linked state paths are rejected', (t) => {
   assert.throws(() => makePlan(f.source, join(linked, 'cache'), { repo: f.repo }), /symbolic links or junctions/);
 });
 
-test('identical profile is reusable and conflicting configuration is never overwritten', async (t) => {
+test('state below any .codex ancestor is rejected before validation or filesystem writes', async (t) => {
+  const f = fixture(t);
+  for (const named of ['.codex', '.CODEX', '.codex.', '.codex ']) {
+    const codex = join(f.base, 'nested', named);
+    const state = join(codex, 'df-mcp', 'state');
+    await assert.rejects(runConfigure(['--root', f.source, '--state-dir', state, '--yes'], runtime(f, {
+      platform: 'win32', env: {}, home: f.base,
+      validateRoot: () => assert.fail('must reject state before source preflight'),
+    })), /outside .codex and CODEX_HOME/);
+    assert.equal(existsSync(codex), false);
+  }
+  assert.throws(() => makePlan(f.source, join(f.base, '.CODEX', 'state'), { repo: f.repo, env: {}, home: f.base }), /outside .codex and CODEX_HOME/);
+});
+
+test('custom CODEX_HOME and a state default inside it are rejected before writes', async (t) => {
+  const f = fixture(t);
+  const codexHome = join(f.base, 'custom-client-data');
+  const r = runtime(f, { platform: 'win32', env: { CODEX_HOME: codexHome, LOCALAPPDATA: codexHome }, home: f.base });
+  await assert.rejects(runConfigure(['--root', f.source, '--state-dir', codexHome, '--yes'], r), /outside .codex and CODEX_HOME/);
+  await assert.rejects(runConfigure(['--root', f.source, '--state-dir', `${codexHome}.`, '--yes'], r), /outside .codex and CODEX_HOME/);
+  await assert.rejects(runConfigure(['--root', f.source, '--yes'], r), /outside .codex and CODEX_HOME/);
+  assert.equal(existsSync(codexHome), false);
+  const allowed = makePlan(f.source, f.state, { repo: f.repo, env: { CODEX_HOME: codexHome }, home: f.base });
+  assert.equal(allowed.base, f.state);
+});
+
+test('a physical alias of CODEX_HOME cannot conceal state inside Codex storage', (t) => {
+  const f = fixture(t);
+  const actual = join(f.base, 'client-data');
+  const codexHome = join(f.base, 'codex-alias');
+  mkdirSync(actual);
+  try { symlinkSync(actual, codexHome, process.platform === 'win32' ? 'junction' : 'dir'); } catch (error) { if (error.code === 'EPERM') { t.skip('Symlink privilege unavailable'); return; } throw error; }
+  const state = join(actual, 'df-mcp');
+  assert.throws(() => makePlan(f.source, state, { repo: f.repo, env: { CODEX_HOME: codexHome }, home: f.base }), /outside .codex and CODEX_HOME/);
+  assert.equal(existsSync(state), false);
+});
+
+test('a linked .codex directory cannot conceal an existing Codex state tree', (t) => {
+  const f = fixture(t);
+  const codexHome = join(f.base, '.codex');
+  const alias = join(f.base, 'external-looking-state');
+  mkdirSync(codexHome);
+  try { symlinkSync(codexHome, alias, process.platform === 'win32' ? 'junction' : 'dir'); } catch (error) { if (error.code === 'EPERM') { t.skip('Symlink privilege unavailable'); return; } throw error; }
+  const state = join(alias, 'df-mcp');
+  assert.throws(() => makePlan(f.source, state, { repo: f.repo, env: {}, home: f.base }), /outside .codex and CODEX_HOME/);
+  assert.equal(existsSync(join(codexHome, 'df-mcp')), false);
+});
+
+test('equivalent profile preserves key order and custom runtime options without rewriting', async (t) => {
   const f = fixture(t); const first = await runConfigure(args(f), runtime(f));
   assert.equal((await runConfigure(args(f), runtime(f))).reused, true);
-  const changed = { ...first.config, poll_seconds: 60 };
+  const changed = { aliases: { '花费': ['支出'] }, state_pool: { max_slots: 8 }, poll_seconds: 60, state_dir: './state', root: f.source, provider: 'local' };
   const previous = `${JSON.stringify(changed)}\n`; writeFileSync(first.plan.configPath, previous);
-  await assert.rejects(runConfigure(args(f), runtime(f)), /different configuration/);
+  const reused = await runConfigure(args(f), runtime(f));
+  assert.equal(reused.reused, true);
+  assert.deepEqual(reused.config, changed);
   assert.equal(readFileSync(first.plan.configPath, 'utf8'), previous);
+});
+
+test('existing profile with a different source or state is never rebound or overwritten', async (t) => {
+  const f = fixture(t); const first = await runConfigure(args(f), runtime(f));
+  const other = join(f.base, 'other'); mkdirSync(other);
+  for (const change of [{ root: other }, { state_dir: other }]) {
+    const previous = `${JSON.stringify({ ...first.config, ...change })}\n`;
+    writeFileSync(first.plan.configPath, previous);
+    await assert.rejects(runConfigure(args(f), runtime(f)), /different source or state/);
+    assert.equal(readFileSync(first.plan.configPath, 'utf8'), previous);
+  }
 });
 
 test('changing folders produces a distinct profile without replacing an earlier one', async (t) => {

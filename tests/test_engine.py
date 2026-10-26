@@ -5,6 +5,7 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 import zipfile
@@ -434,6 +435,133 @@ class EngineTests(unittest.TestCase):
         with self.engine._db() as db:
             paths = [row[0] for row in db.execute("SELECT path FROM files")]
         self.assertTrue(set(paths).issubset({"allowed.txt"}), paths)
+
+    def test_unchanged_unreadable_files_do_not_invalidate_inventory_cursor(self):
+        self.write("photo.png", "image")
+        self.write("archive.zip", "zip")
+        self.write("oversized.txt", "x" * 40)
+        self.engine.limits["max_file_bytes"] = 20
+        self.engine.scan_once()
+        first = self.engine.list(limit=1)
+        generation = first["index_generation"]
+        self.engine.scan_once()
+        continuation = self.engine.list(limit=1, cursor=first["next_cursor"])
+        self.assertEqual(continuation["index_generation"], generation)
+        self.assertEqual(self.engine.status()["coverage"]["states"], {"unsupported": 2, "oversized": 1})
+
+    def test_failed_parser_keeps_filename_searchable_without_stale_body(self):
+        source = self.write("report-marker.txt", "obsoleteword")
+        self.engine.scan_once()
+        source.write_bytes(b"\xff\xfe\x00")
+        self.engine.scan_once()
+        self.assertEqual(self.engine.search("obsoleteword")["files"], [])
+        matches = self.engine.search("report marker")["files"]
+        self.assertEqual(len(matches), 1)
+        self.assertEqual(matches[0]["status"], "failed")
+        self.engine.scan_once()
+        self.assertEqual(len(self.engine.search("report marker")["files"]), 1)
+
+    def test_stable_blocked_and_online_only_metadata_keep_pagination_valid(self):
+        blocked = self.write("blocked.txt", "MUST NOT PARSE")
+        online = self.write("online.txt", "MUST NOT PARSE")
+        entries = [("blocked.txt", blocked.stat(), True, False), ("online.txt", online.stat(), False, True)]
+        with mock.patch.object(self.engine._source, "walk", return_value=entries), \
+             mock.patch.object(self.engine, "_parse_file", side_effect=AssertionError("Excluded source parsed")):
+            self.engine.scan_once()
+            first = self.engine.list(limit=1)
+            self.engine.scan_once()
+            next_page = self.engine.list(limit=1, cursor=first["next_cursor"])
+        self.assertEqual(next_page["index_generation"], first["index_generation"])
+        self.assertEqual(self.engine.status()["coverage"]["states"], {"blocked": 1, "online_only": 1})
+
+    def test_keyword_and_spans_name_and_body_with_stable_relevance_order(self):
+        self.write("华夏.txt", "管理费\n0.20%\n")
+        self.write("a.txt", "华夏 管理费\n")
+        self.write("z-华夏-管理费.txt", "other\n")
+        self.write("irrelevant.txt", "华夏\n")
+        self.engine.scan_once()
+        first = self.engine.search("华夏 管理费", limit=2)
+        second = self.engine.search("华夏 管理费", limit=2, cursor=first["next_cursor"])
+        files = first["files"] + second["files"]
+        self.assertEqual([file["path"] for file in files], ["z-华夏-管理费.txt", "a.txt", "华夏.txt"])
+        self.assertTrue(files[-1]["match"]["terms_matched_across_segments"])
+        self.write("nested/华夏.txt", "管理费")
+        self.engine.scan_once()
+        restricted = self.engine.search("华夏 管理费", prefix="nested")
+        self.assertEqual([file["path"] for file in restricted["files"]], ["nested/华夏.txt"])
+
+    def test_unchanged_poll_does_not_rewrite_entire_checkpoint(self):
+        self.write("one.txt", "one")
+        with mock.patch.object(self.engine._storage, "checkpoint_database", wraps=self.engine._storage.checkpoint_database) as checkpoint:
+            self.engine.scan_once()
+            self.assertEqual(checkpoint.call_count, 1)
+            self.engine.scan_once()
+            self.assertEqual(checkpoint.call_count, 1)
+            self.engine.close()
+            self.assertEqual(checkpoint.call_count, 2)
+
+    def test_compact_cursors_bind_sessions_and_large_unicode_filters(self):
+        binding = {"method": "search", "query": "预算" * 250, "prefix": "文" * 1024, "generation": 42}
+        cursor = self.engine._cursor(binding, 17)
+        self.assertLess(len(cursor), 256)
+        self.assertEqual(self.engine._offset(cursor, binding), 17)
+        self.write("one.txt", "one")
+        self.write("two.txt", "two")
+        self.engine.scan_once()
+        first = self.engine.call("list", {"limit": 1}, session_id="client-a")
+        other = self.engine.call("list", {"limit": 1, "cursor": first["next_cursor"]}, session_id="client-b")
+        self.assertEqual(other["error"]["code"], "INVALID_CURSOR")
+        continued = self.engine.call("list", {"limit": 1, "cursor": first["next_cursor"]}, session_id="client-a")
+        self.assertTrue(continued["ok"])
+
+    def test_nonfinite_and_excessive_poll_values_fail_before_state_creation(self):
+        for value in (float("inf"), float("nan"), -float("inf"), 86401, 10 ** 1000):
+            with self.subTest(value=value):
+                self.config.write_text(json.dumps({"root": "sources", "state_dir": "new-state", "poll_seconds": value}), encoding="utf-8")
+                with self.assertRaises(DriveError) as caught:
+                    Engine(str(self.config), autostart=False)
+                self.assertEqual(caught.exception.code, "INVALID_CONFIG")
+                self.assertFalse((self.base / "new-state").exists())
+
+    def test_fatal_index_thread_error_is_visible_and_releases_state(self):
+        self.engine.refresh()
+        with mock.patch.object(self.engine, "scan_once", side_effect=sqlite3.OperationalError("synthetic disk full")), \
+             mock.patch.object(self.engine, "_db", side_effect=sqlite3.OperationalError("synthetic disk full")):
+            self.engine._run()
+        self.assertEqual(self.engine.call("status")["error"]["code"], "INDEXER_UNHEALTHY")
+        self.assertIsNone(self.engine._sqlite_conn)
+        self.assertIsNone(self.engine._storage.lock_fd)
+
+    def test_state_override_uses_same_boundaries(self):
+        with self.assertRaises(DriveError) as caught:
+            Engine(str(self.config), autostart=False, state_override=self.root / "bad")
+        self.assertEqual(caught.exception.code, "UNSAFE_STATE")
+        self.assertFalse((self.root / "bad").exists())
+        other = Engine(str(self.config), autostart=False, state_override=self.base / "broker-state")
+        try:
+            self.assertEqual(other.state, (self.base / "broker-state").resolve())
+        finally:
+            other.close()
+
+    def test_shutdown_interrupted_parse_is_retried_after_reopen(self):
+        self.write("interrupted.txt", "resumable evidence")
+        self.engine.close()
+        started = threading.Event()
+        def interrupted(engine, snapshot, parsed):
+            started.set()
+            if not engine._stop.wait(5):
+                raise AssertionError("Test shutdown did not arrive")
+            raise DriveError("PARSE_FAILED", "Synthetic killed parser")
+        with mock.patch.object(Engine, "_extract", autospec=True, side_effect=interrupted):
+            self.engine = Engine(str(self.config), autostart=True)
+            self.assertTrue(started.wait(3))
+            self.engine.close()
+        self.engine = Engine(str(self.config), autostart=False)
+        self.assertEqual(self.engine.list()["files"][0]["status"], "pending")
+        self.engine.scan_once()
+        file = self.engine.list()["files"][0]
+        self.assertEqual(file["status"], "ready")
+        self.assertIn("resumable evidence", self.engine.read(file["file_id"])["segments"][0]["text"])
 
 
 if __name__ == "__main__":

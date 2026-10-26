@@ -29,6 +29,9 @@ jobs:
         env:
           DF_MCP_PYTHON: ${{ steps.python.outputs.python-path }}
       - run: npm run test:installer
+      - run: npm run test:doctor
+      - run: npm run test:backend
       - run: npm test
       - run: npm run test:mcp
+      - run: node scripts/mcp-concurrency.mjs
       - run: npm run check:public
