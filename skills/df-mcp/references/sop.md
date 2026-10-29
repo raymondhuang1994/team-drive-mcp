@@ -4,15 +4,19 @@
 
 Call status and confirm the connected source identity, service capabilities, coverage and current job when provided. On older services use job_status to establish whether a scan is running. For a lookup, a few verified excerpts may suffice. Totals, rankings, cross-file comparisons and absence claims require a defined population: project, period, source set, approval status, currency and deduplication keys as applicable.
 
+Use the conversation to choose the workflow. If a capable service's optional plan tool would help, treat its lookup/version/exhaustive/clarification classification as a heuristic suggestion. Do not call it on every question or let a lookup classification relax completeness requirements. Resolve material ambiguity from available context before asking the user.
+
 Enumerate that population through every list page; track exclusions and failed relevant files. If pagination changes generation/session, restart enumeration. Request refresh when freshness matters, then inspect job completion and failures. Do not repeatedly queue identical jobs or busy-poll. Cancel only a job no longer needed or explicitly stopped by the user.
 
 ## Find and verify
 
-Search within the smallest appropriate prefix using names, project IDs, meaningful terms and aliases. Multi-term searches can match evidence across a file; ranking and snippets are candidate selection aids. Search does not prove that every business-relevant source was found.
+Search within the smallest appropriate prefix using names, project IDs, meaningful terms and aliases. Keyword is the default; multi-term keyword searches can match evidence across a file. Where explicitly configured and supported, hybrid/semantic retrieval can help locate paraphrases, and reranking can reorder candidates when requested. Check actual retrieval mode, model availability, indexed coverage, limits and degradation. Rankings and snippets are candidate selection aids; no search mode proves that every business-relevant source was found.
 
 Choose sources by explicit approval/applicability/supersession evidence, not filename or mtime alone. Disambiguate duplicate filenames by relative path and identity. Equal hashes identify byte-identical copies, not which business record should be counted.
 
 Inspect structure, version and warnings, then read the relevant range with `expected_version`. Include the fact's header, units, notes and exceptions. Inspect groups give segment offsets; selectors use source locations (CSV rows, XLSX sheet/rows, PDF page, PPTX slide). With a selector, `start` is the offset within matching segments; there is no A1 column clipping. Text `line_bucket` ranges are navigation buckets, not the document's actual extent.
+
+If context is available and the hit has an actual content ordinal, pass that ordinal and the inspected `expected_version` to gather bounded candidate surroundings. Keep original locators, review `context_reason`, candidate-header caveats, gaps and excluded boundaries. A title or first extracted row is not automatically a verified table header, and notes on later pages can be missed. Use read/inspect to fill the relevant gaps; a context response cannot substitute for the entire population needed for a total or absence claim. On 0.3, continue using versioned read directly.
 
 Follow relevant pagination with the same selector/version. A final selected page does not prove the whole file was read. Partial text extraction may support a bounded finding; retain explicit extraction gaps, including PDF pages without usable text. If the source changes, discard the mixed-version chain and restart that file.
 

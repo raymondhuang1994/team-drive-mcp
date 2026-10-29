@@ -8,8 +8,10 @@ from pathlib import Path
 from .errors import DriveError
 from .engine import DEFAULT_LIMITS
 from .fs_access import validate_state_location
+from .retrieval import validate_config as retrieval_settings
+from .diagnostics import settings as diagnostic_settings
 
-SERVICE_VERSION = "0.3.0"
+SERVICE_VERSION = "0.4.0"
 PROTOCOL_VERSION = 1
 
 
@@ -47,8 +49,13 @@ def settings(config_path):
         aliases = config.get("aliases", {})
         if not isinstance(aliases, dict) or any(not isinstance(key, str) or not isinstance(values, list) or any(not isinstance(value, str) for value in values) for key, values in aliases.items()):
             raise ValueError()
+        for key in ("retrieval", "diagnostics"):
+            if key in config and not isinstance(config[key], dict):
+                raise ValueError()
         effective = dict(config, provider="local", poll_seconds=float(poll), limits=dict(DEFAULT_LIMITS, **limits),
                          aliases={key: sorted(set(values)) for key, values in aliases.items()},
+                         retrieval=retrieval_settings(config.get("retrieval", {})),
+                         diagnostics=diagnostic_settings(config.get("diagnostics")),
                          service={"idle_seconds": float(idle), "max_clients": clients})
         effective.pop("state_pool", None)  # A legacy pool setting cannot create extra shared indexes.
         effective["root"] = os.path.normcase(str(Path(config["root"]).resolve()))

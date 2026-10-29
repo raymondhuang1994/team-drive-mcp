@@ -1,4 +1,4 @@
-"""Bounded local indexing with versioned evidence and no model/network calls."""
+"""Bounded local evidence indexing; optional, explicitly configured local retrieval."""
 from __future__ import annotations
 
 import base64
@@ -22,10 +22,14 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from typing import Any, Dict, Optional
+from collections import OrderedDict
 
 from .errors import DriveError
 from .fs_access import SourceAccess, StateAccess, online_only, validate_state_location
 from .state_pool import JOB_HISTORY_LIMIT, StateLease, pool_settings
+from . import diagnostics as operational
+from .contextual import select_context, plan as evidence_plan
+from .retrieval import Retrieval
 
 
 DEFAULT_LIMITS = {
@@ -103,6 +107,14 @@ class Engine:
                 not isinstance(k, str) or not isinstance(v, list) or
                 any(not isinstance(a, str) for a in v) for k, v in self.aliases.items()):
             raise DriveError("INVALID_CONFIG", "aliases must map strings to lists of strings.")
+        for key in ("retrieval", "diagnostics"):
+            if key in config and not isinstance(config[key], dict):
+                raise DriveError("INVALID_CONFIG", key + " must be an object.")
+        self.retrieval = Retrieval(config.get("retrieval", {}))
+        self.diagnostic_settings = operational.settings(config.get("diagnostics"))
+        self._diagnostic_failures = 0
+        self._ranked_queries = OrderedDict()
+        self._query_lock = threading.RLock()
         max_slots = pool_settings(config)
         parser_signature = hashlib.sha256(Path(__file__).with_name("extract.py").read_bytes()).hexdigest()
         indexer_signature = hashlib.sha256(Path(__file__).read_bytes() + Path(__file__).with_name("fs_access.py").read_bytes()).hexdigest()
@@ -246,6 +258,10 @@ class Engine:
             db.execute("INSERT INTO meta(key,value) VALUES('parse_binding',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (self._parse_binding,))
             db.execute("UPDATE jobs SET status='interrupted',finished_at=? WHERE status IN ('queued','running')", (time.time(),))
             self._prune_jobs(db)
+            operational.init_schema(db)
+            operational.prune(db, self.diagnostic_settings)
+            self.retrieval.init_schema(db)
+            self.retrieval.prune(db)
 
     @staticmethod
     def _prune_jobs(db):
@@ -351,9 +367,16 @@ class Engine:
                     "source_id": self._root_binding,
                     "indexer_health": "healthy" if self._thread is not None else "manual",
                     "current_job_id": self._pending_job,
-                    "search_mode": "keyword_with_configured_aliases_not_semantic",
+                    "search_mode": "keyword_with_aliases_and_bm25",
+                    "retrieval": self.retrieval.status(db),
+                    "capabilities": {"versioned_context": True, "evidence_plan": True,
+                                     "diagnostics": True, "search_modes": ["keyword", "hybrid", "semantic"],
+                                     "ocr": False, "network_source": False, "http_mcp": False},
+                    "diagnostics": dict(self.diagnostic_settings, write_failures=self._diagnostic_failures),
                     "freshness": "Metadata checked during scans; full digest checked for inspect/read/export.",
-                    "network_calls": False, "read_only_sources": True}
+                    "network_calls": bool(self.retrieval.config.get("semantic", {}).get("enabled") or
+                                          self.retrieval.config.get("rerank", {}).get("enabled")),
+                    "read_only_sources": True}
 
     def refresh(self, force=False):
         self._check_root()
@@ -528,6 +551,7 @@ class Engine:
             db.execute("DELETE FROM segments WHERE file_id=?", (file_id,))
             db.execute("DELETE FROM structure WHERE file_id=?", (file_id,))
             db.execute("DELETE FROM search_index WHERE file_id=?", (file_id,))
+            self.retrieval.delete_file(db, file_id)
             if current["status"] != "deleted":
                 db.execute("INSERT INTO search_index(tokens,file_id,ordinal) VALUES(?,?,-1)", (" ".join(tokenize(current["path"])), file_id))
             self._bump(db)
@@ -611,21 +635,26 @@ class Engine:
         return " OR ".join("(" + " AND ".join('"' + token + '"' for token in group) + ")"
                            for group in self._search_groups(query))
 
-    def search(self, query, prefix="", limit=10, cursor=None):
+    def search(self, query, prefix="", limit=10, cursor=None, mode="keyword", rerank=False):
         self._check_root()
         prefix, limit = self._prefix(prefix), self._limit(limit)
+        if mode not in ("keyword", "hybrid", "semantic") or not isinstance(rerank, bool):
+            raise DriveError("INVALID_PARAMS", "Use keyword, hybrid or semantic search and a boolean rerank flag.")
         groups = self._search_groups(query)
+        if mode != "keyword" or rerank:
+            return self._ranked_search(query, prefix, limit, cursor, mode, rerank)
         expression = " OR ".join("(" + " AND ".join('"' + token + '"' for token in group) + ")" for group in groups)
         any_terms = " OR ".join('"' + token + '"' for token in sorted({token for group in groups for token in group}))
         ctes, search_args = [], []
         for index, group in enumerate(groups):
             ctes.append("v%d AS (%s)" % (index, " INTERSECT ".join(
-                "SELECT file_id FROM search_index WHERE search_index MATCH ?" for _ in group)))
+                "SELECT DISTINCT file_id FROM search_index WHERE search_index MATCH ?" for _ in group)))
             search_args.extend('"' + token + '"' for token in group)
         ctes.append("candidates AS (" + " UNION ".join("SELECT file_id FROM v%d" % i for i in range(len(groups))) + ")")
         ctes.append("dense AS (SELECT file_id,MIN(CAST(ordinal AS INTEGER)) ordinal FROM search_index WHERE search_index MATCH ? GROUP BY file_id)")
         ctes.append("hits AS (SELECT file_id,MIN(CASE WHEN CAST(ordinal AS INTEGER)>=0 THEN CAST(ordinal AS INTEGER) END) ordinal FROM search_index WHERE search_index MATCH ? GROUP BY file_id)")
-        search_args.extend([expression, any_terms])
+        ctes.append("scores AS (SELECT file_id,MIN(rank) keyword_rank FROM search_index WHERE search_index MATCH ? GROUP BY file_id)")
+        search_args.extend([expression, any_terms, any_terms])
         cte = "WITH " + ",".join(ctes) + " "
         with self._db() as db:
             db.execute("BEGIN")
@@ -636,13 +665,13 @@ class Engine:
             if prefix:
                 clause += " AND (f.path=? OR substr(f.path,1,?)=?)"
                 args.extend([prefix, len(prefix) + 1, prefix + "/"])
-            join = "FROM files f JOIN candidates c ON f.id=c.file_id LEFT JOIN dense d ON f.id=d.file_id LEFT JOIN hits h ON f.id=h.file_id WHERE " + clause
+            join = "FROM files f JOIN candidates c ON f.id=c.file_id LEFT JOIN dense d ON f.id=d.file_id LEFT JOIN hits h ON f.id=h.file_id LEFT JOIN scores k ON f.id=k.file_id WHERE " + clause
             total = db.execute(cte + "SELECT COUNT(*) " + join, args).fetchone()[0]
             # Exact path phrase, all terms in a path, and all terms in one content
             # segment rank ahead of cross-segment matches. Path breaks ties stably.
             score = "(CASE WHEN instr(lower(f.path),?)>0 THEN 100 ELSE 0 END + CASE WHEN d.ordinal=-1 THEN 30 WHEN d.ordinal>=0 THEN 20 ELSE 0 END)"
-            rows = db.execute(cte + "SELECT f.*,COALESCE(d.ordinal,h.ordinal,-1) ordinal,CASE WHEN d.file_id IS NULL THEN 1 ELSE 0 END across_segments," + score + " relevance " + join +
-                              " ORDER BY relevance DESC,f.path LIMIT ? OFFSET ?", search_args + [query.casefold()] + args[len(search_args):] + [limit, offset]).fetchall()
+            rows = db.execute(cte + "SELECT f.*,COALESCE(d.ordinal,h.ordinal,-1) ordinal,CASE WHEN d.file_id IS NULL THEN 1 ELSE 0 END across_segments,COALESCE(k.keyword_rank,0.0) bm25_score," + score + " relevance " + join +
+                              " ORDER BY relevance DESC,bm25_score ASC,f.path LIMIT ? OFFSET ?", search_args + [query.casefold()] + args[len(search_args):] + [limit, offset]).fetchall()
             files = []
             for row in rows:
                 item = self._file_out(row)
@@ -653,15 +682,88 @@ class Engine:
                                  "snippet": payload.get("text", "")[:600] if payload else row["path"],
                                  "snippet_is_evidence": False,
                                  "terms_matched_across_segments": bool(row["across_segments"]),
-                                 "relevance_score": row["relevance"]}
+                                 "relevance_score": row["relevance"], "bm25_score": row["bm25_score"]}
                 files.append(item)
             base = {"ok": True, "index_generation": generation, "query": query,
                     "total_matching_files": total, "coverage": self._coverage(db),
-                    "mode": "file_level_keyword_candidates", "order": "relevance_then_path",
+                    "mode": "file_level_keyword_candidates", "requested_mode": "keyword", "order": "exact_path_and_phrase_then_bm25_then_path",
                     "matching_scope": "Each alias alternative requires all its terms somewhere in the same file's path or extracted text.",
                     "freshness": "indexed_not_revalidated", "exhaustive_for_business_totals": False,
                     "next_action": "Inspect and read matching sources before answering; keyword matches do not establish a complete business dataset."}
         return self._page(base, "files", files, limit, offset, total, binding)
+
+    def _ranked_search(self, query, prefix, limit, cursor, mode, rerank):
+        """Freeze bounded model-assisted results for pagination within this session."""
+        session = getattr(self._session, "session_id", "")
+        with self._query_lock, self._db() as db:
+            generation = self._generation(db)
+            key = (session, generation, query, prefix, mode, rerank)
+            binding = {"method": "ranked_search", "query": query, "prefix": prefix,
+                       "generation": generation, "mode": mode, "rerank": rerank}
+            cached = self._ranked_queries.get(key)
+            if cursor and (cached is None or time.monotonic() - cached[0] > 300):
+                # Authenticate first so another session's cursor remains invalid.
+                self._offset(cursor, dict(binding, snapshot=None))
+                raise DriveError("STALE_CURSOR", "The ranked result snapshot expired.", True, "Restart search without a cursor.")
+            if not cursor and (cached is None or time.monotonic() - cached[0] > 300):
+                terms = sorted({term for group in self._search_groups(query) for term in group})
+                expression = " OR ".join('"' + term + '"' for term in terms)
+                keyword_ids, keyword_total = None, None
+                if mode == "keyword":
+                    # Reordering must not change the default all-terms/alias matching
+                    # condition. Filter eligible IDs before the bounded BM25 pool.
+                    keyword_ids = []
+                    keyword_cursor = None
+                    cap = self.retrieval.config["candidate_limit"]
+                    while len(keyword_ids) < cap:
+                        page = self.search(query, prefix=prefix, limit=min(100, cap - len(keyword_ids)),
+                                           cursor=keyword_cursor)
+                        keyword_total = page["total_matching_files"]
+                        keyword_ids.extend(item["file_id"] for item in page["files"])
+                        keyword_cursor = page["next_cursor"]
+                        if not keyword_cursor:
+                            break
+                ranked = self.retrieval.search(db, query, prefix=prefix, keyword_expression=expression,
+                                               mode=mode, rerank=rerank, keyword_file_ids=keyword_ids)
+                if keyword_ids is not None:
+                    ranked["diagnostics"].update(keyword_matching_files=keyword_total,
+                                                 keyword_eligible_files=len(keyword_ids),
+                                                 keyword_scope_truncated=keyword_total > len(keyword_ids))
+                files, seen = [], set()
+                for hit in ranked["hits"]:
+                    if hit["file_id"] in seen:
+                        continue
+                    row = db.execute("SELECT * FROM files WHERE id=? AND source_version=? AND status='ready'",
+                                     (hit["file_id"], hit["source_version"])).fetchone()
+                    if row is None:
+                        continue
+                    seen.add(hit["file_id"])
+                    segment = db.execute("SELECT payload FROM segments WHERE file_id=? AND source_version=? AND ordinal=?",
+                                         (hit["file_id"], hit["source_version"], hit["ordinal"])).fetchone()
+                    payload = json.loads(segment[0]) if segment else None
+                    item = self._file_out(row)
+                    item["match"] = {"kind": "content" if payload else "path", "ordinal": hit["ordinal"],
+                                     "locator": payload.get("locator") if payload else None,
+                                     "snippet": payload.get("text", "")[:600] if payload else row["path"],
+                                     "snippet_is_evidence": False, "relevance_score": hit["score"],
+                                     "signals": hit.get("signals", {})}
+                    files.append(item)
+                cached = (time.monotonic(), files, ranked["diagnostics"], uuid.uuid4().hex)
+                self._ranked_queries[key] = cached
+                self._ranked_queries.move_to_end(key)
+                while len(self._ranked_queries) > 32:
+                    self._ranked_queries.popitem(last=False)
+            binding["snapshot"] = cached[3]
+            offset = self._offset(cursor, binding)
+            files, diagnostics = cached[1], cached[2]
+            base = {"ok": True, "index_generation": generation, "query": query,
+                    "requested_mode": mode, "rerank_requested": rerank,
+                    "mode": "bounded_ranked_candidates", "order": "retrieval_score_then_path",
+                    "total_matching_files": len(files), "total_scope": "This bounded candidate pool only; not all matching files.",
+                    "coverage": self._coverage(db), "retrieval": diagnostics,
+                    "freshness": "indexed_not_revalidated", "exhaustive_for_business_totals": False,
+                    "next_action": "Inspect and read source versions; inspect retrieval diagnostics for unavailable or partial model indexes."}
+            return self._page(base, "files", files[offset:offset + limit], limit, offset, len(files), binding)
 
     def inspect(self, file_id, limit=20, cursor=None):
         limit = self._limit(limit)
@@ -747,6 +849,47 @@ class Engine:
         result["whole_file_in_response"] = selector is None and offset == 0 and result["returned"] == total
         result["selection_complete_in_response"] = offset == 0 and result["returned"] == matched
         return result
+
+    def context(self, file_id, expected_version, ordinal, before=2, after=2, max_segments=30):
+        if not isinstance(expected_version, str) or not expected_version:
+            raise DriveError("EXPECTED_VERSION_REQUIRED", "Context requires the inspected source version.")
+        row = self._validated(file_id, expected_version)
+        with self._db() as db:
+            db.execute("BEGIN")
+            result = select_context(db, file_id, expected_version, ordinal, before, after, max_segments)
+            total = db.execute("SELECT COUNT(*) FROM segments WHERE file_id=? AND source_version=?",
+                               (file_id, expected_version)).fetchone()[0]
+        if total != row["segments_count"]:
+            raise DriveError("INDEX_CHANGED", "The index changed during context selection.", True, "Inspect and restart.")
+        self._validated(file_id, expected_version)
+        result.update(path=row["path"], total_segments=total,
+                      freshness="digest_verified_before_and_after_context",
+                      extraction_complete=bool(row["extraction_complete"]),
+                      format_warnings=json.loads(row["format_warnings"]),
+                      content_coverage=json.loads(row["content_coverage"]))
+        return result
+
+    def plan(self, query, prefix=""):
+        return evidence_plan(query, self._prefix(prefix))
+
+    def diagnostics(self, limit=20):
+        limit = self._limit(limit)
+        with self._db() as db:
+            result = operational.report(db, self.diagnostic_settings, limit)
+        result["write_failures"] = self._diagnostic_failures
+        return result
+
+    def _record_operation(self, operation, started, result):
+        if not self.diagnostic_settings["enabled"]:
+            return
+        try:
+            with self._db() as db:
+                operational.record(db, self.diagnostic_settings, operation,
+                                   (time.perf_counter() - started) * 1000,
+                                   result.get("ok", False), result.get("error", {}).get("code"))
+        except Exception:
+            # Optional metrics must not replace an evidence result or leak content.
+            self._diagnostic_failures += 1
 
     def export(self, file_id, expected_version, format="jsonl"):
         if format != "jsonl":
@@ -859,7 +1002,7 @@ class Engine:
                            "extraction_complete": entry.get("extraction_complete", False)} for entry in entries]}
 
     def call(self, method, params=None, session_id=None):
-        methods = {name: getattr(self, name) for name in ("status", "refresh", "job_status", "cancel", "list", "search", "inspect", "read", "export", "evidence_bundle")}
+        methods = {name: getattr(self, name) for name in ("status", "refresh", "job_status", "cancel", "list", "search", "inspect", "read", "context", "plan", "diagnostics", "export", "evidence_bundle")}
         if not isinstance(method, str) or method not in methods:
             return failure("UNKNOWN_METHOD", "The requested method is not supported.")
         if params is None:
@@ -870,23 +1013,30 @@ class Engine:
             return failure("INVALID_SESSION", "The service session identifier is invalid.")
         previous_session = getattr(self._session, "session_id", "")
         self._session.session_id = session_id or ""
+        started = time.perf_counter()
+        result = failure("INTERNAL_ERROR", "The operation did not finish.")
         try:
             self._check_health()
             result = methods[method](**params)
             if len(_json(result).encode()) > MAX_RESPONSE_BYTES:
-                return failure("RESPONSE_TOO_LARGE", "The response exceeds the bounded output size.", False, "Narrow the query or reduce the page size.")
+                result = failure("RESPONSE_TOO_LARGE", "The response exceeds the bounded output size.", False, "Narrow the query or reduce the page size.")
             return result
         except DriveError as exc:
-            return failure(exc.code, exc.message, exc.retryable, exc.next_action)
+            result = failure(exc.code, exc.message, exc.retryable, exc.next_action)
+            return result
         except TypeError:
-            return failure("INVALID_PARAMS", "Parameters do not match this tool's input schema.")
+            result = failure("INVALID_PARAMS", "Parameters do not match this tool's input schema.")
+            return result
         except Exception:
-            return failure("INTERNAL_ERROR", "The operation could not complete.", True, "Check local service health; no source content was modified.")
+            result = failure("INTERNAL_ERROR", "The operation could not complete.", True, "Check local service health; no source content was modified.")
+            return result
         finally:
             self._session.session_id = previous_session
+            self._record_operation(method, started, result)
 
     def scan_once(self, job_id=None, force=False):
         """Synchronous scan used by the worker thread and deterministic tests."""
+        started = time.perf_counter()
         self._check_root()
         with self._scan_lock:
             scan_id = uuid.uuid4().hex
@@ -928,6 +1078,7 @@ class Engine:
                         db.execute("DELETE FROM segments WHERE file_id=?", (file_id,))
                         db.execute("DELETE FROM structure WHERE file_id=?", (file_id,))
                         db.execute("DELETE FROM search_index WHERE file_id=?", (file_id,))
+                        self.retrieval.delete_file(db, file_id)
                         db.execute("INSERT INTO search_index(tokens,file_id,ordinal) VALUES(?,?,-1)", (" ".join(tokenize(relative)), file_id))
                         self._bump(db)
                 discovered += 1
@@ -941,6 +1092,7 @@ class Engine:
                         db.execute("DELETE FROM segments WHERE file_id=?", (file_id,))
                         db.execute("DELETE FROM structure WHERE file_id=?", (file_id,))
                         db.execute("DELETE FROM search_index WHERE file_id=?", (file_id,))
+                        self.retrieval.delete_file(db, file_id)
                     if removed:
                         self._bump(db)
                 db.execute("UPDATE meta SET value=? WHERE key='inventory_complete'", ("true" if complete else "false",))
@@ -958,15 +1110,41 @@ class Engine:
                 with self._db() as db:
                     db.execute("UPDATE jobs SET processed=? WHERE id=?", (processed, job_id))
             cancelled = job_id in self._cancelled or self._stop.is_set()
+            if complete and not cancelled and self.retrieval.config["semantic"]["enabled"]:
+                # Text extraction stays usable if the optional model is unavailable.
+                # One scan spends at most a bounded window filling the vector cache;
+                # later scans resume from persistent segment digests.
+                deadline = time.monotonic() + 20
+                with self._db() as db:
+                    pending_vectors = db.execute("SELECT id,source_version FROM files WHERE status='ready' ORDER BY path").fetchall()
+                for vector_file in pending_vectors:
+                    if time.monotonic() >= deadline or self._stop.is_set() or job_id in self._cancelled:
+                        break
+                    vector_start = time.perf_counter()
+                    with self._db() as db:
+                        indexed = self.retrieval.index_file(db, vector_file["id"], vector_file["source_version"],
+                                                           deadline=deadline)
+                        if indexed.get("newly_indexed_segments", 0):
+                            self._bump(db)
+                    self._record_operation("semantic_index", vector_start,
+                                           {"ok": not indexed.get("error_code"),
+                                            "error": {"code": indexed.get("error_code")}})
+                    if indexed.get("error_code"):
+                        break
+            cancelled = job_id in self._cancelled or self._stop.is_set()
             with self._db() as db:
                 db.execute("UPDATE jobs SET status=?,finished_at=?,error_code=? WHERE id=?", ("cancelled" if cancelled else "complete" if complete else "failed", time.time(), None if complete else "INVENTORY_INCOMPLETE", job_id))
                 db.execute("UPDATE meta SET value=? WHERE key='last_scan_at'", (_json(time.time()),))
                 self._prune_jobs(db)
             if complete and not cancelled:
                 self._checkpoint()
-            return self.job_status(job_id)
+            result = self.job_status(job_id)
+            self._record_operation("scan", started, {"ok": complete and not cancelled,
+                                   "error": {"code": "CANCELLED" if cancelled else "INVENTORY_INCOMPLETE" if not complete else None}})
+            return result
 
     def _parse_file(self, row):
+        started = time.perf_counter()
         name = "job-temp-" + uuid.uuid4().hex
         try:
             with self._storage.directory(name, create=True) as work_dir:
@@ -974,6 +1152,11 @@ class Engine:
             self._storage.remove_empty_directory(name)
         except DriveError as exc:
             self._parse_failure(row["id"], exc.code, exc.message)
+        finally:
+            with self._db() as db:
+                state = db.execute("SELECT status,error_code FROM files WHERE id=?", (row["id"],)).fetchone()
+            self._record_operation("parse", started, {"ok": bool(state and state["status"] == "ready"),
+                                   "error": {"code": state["error_code"] if state else "FILE_NOT_FOUND"}})
 
     def _parse_failure(self, file_id, code, message):
         if self._stop.is_set():

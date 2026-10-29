@@ -1,14 +1,17 @@
 # Tool contract quick reference
 
-These inputs describe the local reader. The Skill is named `df-mcp`; the `team_drive_` tool prefix is retained for compatibility. The connected server's declared schema is authoritative if versions differ. Discover available tools from the connected schema; status is not a substitute for tool discovery. Limits below use defaults, not performance guarantees.
+These inputs describe the local reader's 0.4 contract (13 tools). The Skill is named `df-mcp`; the `team_drive_` tool prefix is retained for compatibility. The connected server's declared schema is authoritative if versions differ. Discover available tools from the connected schema and check status capabilities before using additions; status is not a substitute for tool discovery. Older 0.3 services remain usable with list/search/inspect/read and versioned exports; omit unsupported parameters and use the existing reading workflow when context/plan/diagnostics are absent. Limits below use defaults, not performance guarantees.
 
 | Tool | Inputs | Key result / next step |
 |---|---|---|
 | `team_drive_status` | none | `service_version`, source/config identity, shared-service health, `current_job_id` (use job_status for detail), `state_storage`, `coverage`, `last_scan_at` and limits when supported. Older versions omit newer fields. |
 | `team_drive_list` | `prefix?`, `limit?` (default 20), `cursor?` | `files`, `total_matching_files`, `has_more`, `next_cursor`; inventory metadata is not freshly read evidence. |
-| `team_drive_search` | `query`, `prefix?`, `limit?` (default 10), `cursor?` | Ranked candidate files (use the returned `order` on older versions); `match.ordinal` and snippet help locate a read. `snippet_is_evidence` is false. |
+| `team_drive_search` | `query`, `prefix?`, `limit?` (default 10), `cursor?`, `mode?` (`keyword` default, `hybrid`, `semantic`), `rerank?` (default false) | Ranked candidate files; `match.ordinal` and snippet help locate a read. `snippet_is_evidence` is false. Model-assisted results have a bounded candidate pool and retrieval diagnostics; inspect actual enabled/coverage/error state. |
 | `team_drive_inspect` | `file_id`, `limit?` (default 20), `cursor?` | Verified `source_version`, file warnings and paginated `structure` groups with zero-based `start`/`end` segment ordinals. |
 | `team_drive_read` | `file_id`, `start?` (default 0), `limit?` (default 10), `expected_version?`, `cursor?`, `selector?` | `segments`, locators, version and warnings. Always pass the inspected version for evidence chains. A cursor supplies the next offset; selector filters supported source locations. |
+| `team_drive_context` | `file_id`, **`expected_version`**, `ordinal`, `before?`/`after?` (default 2, range 0–20), `max_segments?` (default 30, range 1–100) | Version-checked bounded context around an actual segment ordinal. Preserves locators and original ordinals, with `context_reason`, `requested`, `returned`, `coverage`, `gaps` and `excluded_by_boundary`. Has no continuation cursor; use read for missing context. |
+| `team_drive_plan` | `query`, `prefix?` | Optional deterministic heuristic `classification`, steps and guardrails. It does not search, read, establish approved sources or certify completeness; do not call it mechanically for every question. |
+| `team_drive_diagnostics` | `limit?` (default 20) | Recent bounded operation timing/error records and p50/p95 aggregates; not answer accuracy or all-time totals. No query, source text or paths are recorded. |
 | `team_drive_export` | `file_id`, **`expected_version`**, `format?` (`jsonl` only) | Whole supported extraction, `artifact_id` relative to state, runtime absolute `artifact_path`, version, count and format warnings. No arbitrary output path. |
 | `team_drive_evidence_bundle` | `files` (1–50 objects containing `file_id`, `expected_version`), `scope_description?` (default empty string; supply a scope for this workflow) | `artifact_path` / `artifact_id` for the manifest, `files`, `observation_interval`, `all_selected_versions_exported`, `all_selected_text_complete`, and failed/exported counts. `ok: true` means the manifest was created, not that every input succeeded. |
 | `team_drive_refresh` | `force?` (default false) | `job_id`. Force permits retrying unchanged failed files; ordinary scans avoid repeated expensive failure. |
@@ -16,6 +19,16 @@ These inputs describe the local reader. The Skill is named `df-mcp`; the `team_d
 | `team_drive_cancel` | `job_id` | Requests cancellation at the next file boundary; current parsing is not immediately killed. |
 
 All page `limit` values must be 1–100. `query` accepts 1–500 characters. `prefix` is a root-relative file/directory prefix, not a shell glob. Never invent a `file_id`; obtain it from list/search.
+
+## Optional retrieval and context
+
+Keyword search uses configured aliases with exact token matching and BM25 ranking. Semantic/hybrid modes require checking `retrieval.semantic` for enabled state, indexed/eligible segments, truncation and errors. `rerank: true` requests the separately configured reranker; it is false by default even when a reranker is configured. A disabled or failed semantic/rerank service is not evidence that a business fact is absent. Read the actual response's mode, fallback and scope rather than assuming a requested mode succeeded. Real-model accuracy and latency have not been established by the implementation's synthetic tests.
+
+Model-assisted search freezes a bounded result set for session pagination. Its `total_matching_files` counts that candidate pool only, not every matching source. Preserve query, prefix, mode and rerank across cursor pages; stale/expired snapshots require a new search. Neither keyword nor semantic relevance establishes a complete business population.
+
+`context` checks the source digest before and after selection. Its segment ordinals can be non-contiguous: the requested hit has priority, followed by extracted heading and first-row candidates, neighboring segments and nearby note/unit candidates. A worksheet/table's first extracted row is only a candidate header; it can be a title, data row or part of a split row. Notes and units are searched only in a bounded nearby extraction window. Page, slide, sheet and table boundaries can exclude relevant continuations or later-page footnotes. Inspect the returned gaps and use read/inspect for any missing qualification.
+
+Context has both segment and serialized-byte limits; fewer than `max_segments` can be returned. `coverage.requested_neighborhood_complete` concerns only requested ordinal neighbors, and `all_identified_candidates_returned` only the candidates found by this heuristic. Neither field certifies full document, table, visual or business coverage. File-level extraction gaps remain in `content_coverage` and `format_warnings`.
 
 `selector` is an optional nonempty object with these format-specific combinations:
 
@@ -33,7 +46,7 @@ Do not mix these combinations. Unknown fields, reversed ranges and incompatible 
 
 `coverage.inventory_complete` concerns the last inventory traversal. `present_files` counts non-deleted entries; `indexed_files` counts `ready` files; `states` reports all observed states; `all_present_files_indexed` requires completed inventory and every present file ready. `partial_files` and `all_present_files_extracted_completely` distinguish ready partial extractions from complete text coverage. `business_completeness` remains `not_established` because a parser cannot establish business authority or missing out-of-root sources.
 
-File states include `ready`, `pending`, `failed`, `blocked`, `unsupported`, `oversized`, `online_only`, `stale` and `deleted`. The `online_only` state reflects a detected operating-system condition, not a comprehensive OneDrive availability check. Inspect/read/export require a ready file and validate its whole-content digest. Ready PDF files may still have `extraction_complete: false`; read `content_coverage.missing_text_pages` and other gaps.
+File states include `ready`, `pending`, `failed`, `blocked`, `unsupported`, `oversized`, `online_only`, `stale` and `deleted`. The `online_only` state reflects a detected operating-system condition, not a comprehensive OneDrive availability check. Inspect/read/context/export require a ready file and validate its whole-content digest. Ready PDF files may still have `extraction_complete: false`; read `content_coverage.missing_text_pages` and other gaps.
 
 `extraction_complete: true` means extraction finished within supported format scope; it is false for explicit missing-text PDF pages. `content_coverage` gives total/pages-with-text/missing-text pages and `ocr_performed: false`; blank and image-only pages are not automatically distinguished. Read `format_warnings` and segment warnings anyway. `truncated: true` mirrors pagination (`has_more`) in this release: follow `next_cursor` to continue. A final page does not establish complete business coverage.
 
@@ -49,7 +62,7 @@ Linux parser workers additionally have an address-space limit. macOS and Windows
 
 ## Example call chain
 
-For a clause lookup: status → search with a project term → inspect the selected `file_id` → read at the matching structure group's `start`, passing `expected_version` → inspect returned context/warnings → cite its locator.
+For a clause lookup: status → search with a project term → inspect the selected `file_id` → read at the matching structure group's `start`, passing `expected_version` → inspect returned context/warnings → cite its locator. When available, context can first gather candidates around `match.ordinal` using the inspected version; read any gaps and necessary qualifications before answering. A path-only match has no usable content ordinal, so navigate using inspect instead.
 
 For a full total: status/refresh → enumerate the defined scope → inspect relevant files → create an evidence bundle (or individual versioned exports on older servers) → check manifest/gaps, counts, definitions, currency and duplicates → compute deterministically. The tool chain does not supply missing business definitions automatically.
 

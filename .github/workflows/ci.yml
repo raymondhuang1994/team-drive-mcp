@@ -49,6 +49,7 @@ jobs:
       - run: npm run test:doctor
       - run: npm run test:backend
       - run: npm test
+      - run: npm run evaluate
       - run: npm run test:mcp
       - run: node scripts/mcp-concurrency.mjs
       - run: npm run test:install
