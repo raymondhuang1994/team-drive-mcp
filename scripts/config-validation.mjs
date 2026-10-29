@@ -26,7 +26,9 @@ function localEndpoint(value) {
 }
 
 export function validateRuntimeOptions(config) {
-  if (!object(config) || (config.provider !== undefined && config.provider !== 'local')) throw new Error('Only a local source configuration is supported.');
+  if (!object(config) || !['local', 'microsoft_graph'].includes(config.provider ?? 'local')) throw new Error('Use a local or microsoft_graph source configuration.');
+  if (config.provider === 'microsoft_graph') validateGraphOptions(config.graph);
+  else if (config.graph !== undefined) throw new Error('Graph settings require provider=microsoft_graph.');
   if (config.poll_seconds !== undefined && (typeof config.poll_seconds !== 'number' || !Number.isFinite(config.poll_seconds) || config.poll_seconds < 1 || config.poll_seconds > 86400)) throw new Error('poll_seconds must be a finite number between 1 and 86400.');
   if (config.limits !== undefined) {
     if (!object(config.limits) || Object.entries(config.limits).some(([key, value]) => !limitKeys.has(key) || !Number.isSafeInteger(value) || value < 1)) throw new Error('limits must use known keys and positive safe integers.');
@@ -64,4 +66,27 @@ export function validateRuntimeOptions(config) {
     }
   }
   return config;
+}
+
+export function validateGraphOptions(graph) {
+  const keys = ['tenant_id', 'client_id', 'drive_id', 'folder_id', 'scopes', 'token_env', 'auth_cache',
+    'timeout_seconds', 'max_items', 'max_pages', 'max_depth', 'scan_budget_seconds'];
+  if (!object(graph) || Object.keys(graph).some(key => !keys.includes(key))) throw new Error('Use supported Microsoft Graph configuration fields.');
+  // JS $ can match before a final newline; Python fullmatch rejects that input.
+  const full = (pattern, value) => typeof value === 'string' && value.match(pattern)?.[0] === value;
+  const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+  if (!(full(uuid, graph.tenant_id) || ['common', 'organizations', 'consumers'].includes(graph.tenant_id))) throw new Error('Use a tenant UUID or an official Microsoft tenant alias.');
+  if (!full(uuid, graph.client_id)) throw new Error('Use the registered application client UUID.');
+  for (const key of ['drive_id', 'folder_id']) if (!full(/^[A-Za-z0-9!._~-]{1,256}$/, graph[key]) || ['.', '..', 'root'].includes(graph[key])) throw new Error('Use explicit drive and folder item IDs.');
+  if (graph.scopes !== undefined) {
+    const resource = s => typeof s === 'string' && ['files.read', 'files.read.all', 'sites.read.all'].includes(s.replace(/^https:\/\/graph\.microsoft\.com\//, '').toLowerCase());
+    const identity = s => typeof s === 'string' && ['offline_access', 'openid', 'profile'].includes(s.replace(/^https:\/\/graph\.microsoft\.com\//, ''));
+    if (!Array.isArray(graph.scopes) || !graph.scopes.length || graph.scopes.length > 6 || !graph.scopes.some(resource) || graph.scopes.some(s => !resource(s) && !identity(s))) throw new Error('Only documented read-only Graph scopes are supported.');
+  }
+  if (graph.token_env !== undefined && !full(/^[A-Za-z_][A-Za-z0-9_]{0,127}$/, graph.token_env)) throw new Error('token_env must name an environment variable, never contain a token.');
+  if (graph.auth_cache !== undefined && (typeof graph.auth_cache !== 'string' || !graph.auth_cache.trim() || graph.auth_cache.includes('\0'))) throw new Error('auth_cache must be a private local path.');
+  if (!graph.auth_cache && !graph.token_env) throw new Error('Configure a private auth_cache or an explicit token_env.');
+  const limits = { timeout_seconds: [0.1, 20, false], max_items: [1, 100000, true], max_pages: [1, 10000, true], max_depth: [1, 128, true], scan_budget_seconds: [1, 600, false] };
+  for (const [key, range] of Object.entries(limits)) if (graph[key] !== undefined && !bounded(graph[key], ...range)) throw new Error(`Invalid graph.${key}.`);
+  return graph;
 }

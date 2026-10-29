@@ -526,7 +526,8 @@ class Retrieval:
             self._last_rerank_error = exc.code
             return hits, {"state": "failed", "error_code": exc.code, "fallback": "rrf_order_preserved"}
 
-    def search(self, db, query, prefix="", keyword_expression=None, mode="hybrid", rerank=False, keyword_file_ids=None):
+    def search(self, db, query, prefix="", keyword_expression=None, mode="hybrid", rerank=False, keyword_file_ids=None,
+               before_rerank=None):
         """Return bounded discovery hits and transparent degradation diagnostics.
 
         Caller validates query/prefix and retains existing evidence-read safeguards.
@@ -561,6 +562,8 @@ class Retrieval:
                 fused[key]["signals"][label + "_rank"] = rank
                 fused[key]["signals"][label + "_score"] = item["raw_score"]
         hits = sorted(fused.values(), key=lambda item: (-item["score"], item["path"]))[:self.config["candidate_limit"]]
+        if before_rerank is not None and rerank and self.config["rerank"]["enabled"] and hits:
+            before_rerank(hits[:self.config["rerank"]["max_candidates"]], deadline)
         hits, rerank_diag = self._rerank(db, query, hits, requested=rerank, deadline=deadline)
         status = self.status(db)
         effective_mode = (("semantic_partial" if semantic_diag["state"] == "partial" else "semantic")

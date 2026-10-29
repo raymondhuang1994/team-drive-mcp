@@ -32,7 +32,7 @@ export async function runCall(argv) {
   const args = parseCallArguments(argv);
   if (args.help) { console.log(help); return; }
   if (args.demo) console.error('SIMULATED example library selected explicitly.');
-  const client = new Client({ name: 'df-mcp-cli', version: '0.4.0' });
+  const client = new Client({ name: 'df-mcp-cli', version: '0.5.0' });
   async function waitForJob(jobId) {
     const until = Date.now() + 60_000;
     while (Date.now() < until) {

@@ -1,5 +1,15 @@
 # 验证记录
 
+## 0.5.0 / 2026-10-29：OneDrive / SharePoint 来源
+
+新增 Microsoft Graph 单文件夹来源、显式设备码登录与静默刷新、按需下载解析、云端原始链接及版本引用。本地来源和 13 个 MCP 工具保持兼容。检索候选及可选模型输入前核验云端访问和 etag；证据读取另行下载并校验内容。部分枚举、断网、撤权和限流不能作为空目录或成功的离线证据。
+
+本地 macOS、Node.js 26.9.0、Python 3.9.6：Python 257 项中 250 项通过、7 项 Windows 专项跳过。新增 51 项覆盖 Graph 来源、OAuth/缓存和真实 Engine/解析/存储。安装器 36/36、doctor 8/8、云配置 17/17（含 123 组 JS/Python 一致性场景）、Backend 3/3；TypeScript 构建、Skill 官方格式校验通过。`npm run evaluate -- --output .local/evaluation-v05.json` 的合成评测 14/14 通过，不代表 LLM 回答准确率。
+
+`npm run test:cloud` 通过真实 SDK stdio → bridge → broker → Engine → parser/storage 链路验证 13 工具、来源与版本、导出和证据包、403 缓存拒绝、503 不误删、缺少授权及空 anchor。测试注入合成 Graph 响应并禁止真实 HTTP，不访问 Microsoft 租户。原本地 MCP、六客户端并发/崩溃恢复、完整安装与索引重用均通过。
+
+GitHub CI 已配置 Windows/macOS/Linux 与 Python 3.9/3.13，增加云配置和云 MCP 测试；具体提交的执行结果以 Actions 为准。尚未在真实租户验证企业同意、条件访问、设备码策略或网络出口；公司 OneDrive/SharePoint 的实际接入须按[云盘验收步骤](CLOUD_DRIVE.md)完成。当前仍是单个本机用户的 stdio 服务，不提供团队 HTTP 服务或多用户身份隔离；不新增 SMB/UNC、OCR 或云文件写入。
+
 ## 0.4.0 / 2026-10-29：证据上下文、检索与可重复评测
 
 本次在 macOS、Node.js 26.9.0、Python 3.9.6 验证：Python 206 项中 199 项通过、7 项 Windows 专项跳过；安装器 36/36、doctor 8/8（含 91 组 Python/JS 配置一致性场景）、Backend 3/3 通过。TypeScript 构建、Skill 官方格式校验、源码公开内容扫描与 diff whitespace 检查通过。本轮没有推送或执行远程 CI；Windows/Linux 效果仍需对应运行环境验证。

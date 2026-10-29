@@ -47,10 +47,12 @@ jobs:
           DF_MCP_PYTHON: ${{ steps.python.outputs.python-path }}
       - run: npm run test:installer
       - run: npm run test:doctor
+      - run: npm run test:cloud-configure
       - run: npm run test:backend
       - run: npm test
-      - run: npm run evaluate
+      - run: npm run evaluate -- --output .local/evaluation-ci.json
       - run: npm run test:mcp
+      - run: npm run test:cloud
       - run: node scripts/mcp-concurrency.mjs
       - run: npm run test:install
       - run: npm run check:public

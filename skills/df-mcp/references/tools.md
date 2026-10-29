@@ -1,10 +1,10 @@
 # Tool contract quick reference
 
-These inputs describe the local reader's 0.4 contract (13 tools). The Skill is named `df-mcp`; the `team_drive_` tool prefix is retained for compatibility. The connected server's declared schema is authoritative if versions differ. Discover available tools from the connected schema and check status capabilities before using additions; status is not a substitute for tool discovery. Older 0.3 services remain usable with list/search/inspect/read and versioned exports; omit unsupported parameters and use the existing reading workflow when context/plan/diagnostics are absent. Limits below use defaults, not performance guarantees.
+These inputs describe the reader's 0.5 contract (13 tools), with local and explicitly configured Microsoft Graph sources. The Skill is named `df-mcp`; the `team_drive_` tool prefix is retained for compatibility. The connected server's declared schema is authoritative if versions differ. Discover available tools from the connected schema and check status capabilities before using additions; status is not a substitute for tool discovery. Older 0.3/0.4 services retain their supported local workflows; omit unsupported parameters and use versioned read when context/plan/diagnostics are absent. Limits below use defaults, not performance guarantees. Real Graph APIs are implemented; synthetic tests do not establish real-tenant acceptance.
 
 | Tool | Inputs | Key result / next step |
 |---|---|---|
-| `team_drive_status` | none | `service_version`, source/config identity, shared-service health, `current_job_id` (use job_status for detail), `state_storage`, `coverage`, `last_scan_at` and limits when supported. Older versions omit newer fields. |
+| `team_drive_status` | none | `service_version`, provider, source/config identity, `cloud_source` when applicable, shared-service health, `current_job_id` (use job_status for detail), `state_storage`, `coverage`, `last_scan_at` and limits when supported. Older versions omit newer fields. |
 | `team_drive_list` | `prefix?`, `limit?` (default 20), `cursor?` | `files`, `total_matching_files`, `has_more`, `next_cursor`; inventory metadata is not freshly read evidence. |
 | `team_drive_search` | `query`, `prefix?`, `limit?` (default 10), `cursor?`, `mode?` (`keyword` default, `hybrid`, `semantic`), `rerank?` (default false) | Ranked candidate files; `match.ordinal` and snippet help locate a read. `snippet_is_evidence` is false. Model-assisted results have a bounded candidate pool and retrieval diagnostics; inspect actual enabled/coverage/error state. |
 | `team_drive_inspect` | `file_id`, `limit?` (default 20), `cursor?` | Verified `source_version`, file warnings and paginated `structure` groups with zero-based `start`/`end` segment ordinals. |
@@ -18,7 +18,17 @@ These inputs describe the local reader's 0.4 contract (13 tools). The Skill is n
 | `team_drive_job_status` | `job_id?` | Latest job if omitted; job state/progress and coverage. |
 | `team_drive_cancel` | `job_id` | Requests cancellation at the next file boundary; current parsing is not immediately killed. |
 
-All page `limit` values must be 1–100. `query` accepts 1–500 characters. `prefix` is a root-relative file/directory prefix, not a shell glob. Never invent a `file_id`; obtain it from list/search.
+All page `limit` values must be 1–100. `query` accepts 1–500 characters. `prefix` is relative to the configured local root or cloud folder, not a sharing URL, local anchor path or shell glob. Never invent a `file_id`; obtain it from list/search.
+
+## Cloud provenance and access
+
+For `microsoft_graph`, the local `root` is an empty cloud-anchor used for state guards. Cloud tenant/application/drive/folder and authenticated account binding identify the source. MCP remains local stdio; setting the provider does not create a remote MCP server or grant Microsoft permissions.
+
+`file.origin` preserves `provider`, `drive_id`, `folder_id`, `item_id`, safe `web_url` when available, `etag`, optional `ctag`, remote modification and verification times. After verified content extraction it also carries `content_sha256`. `source_version` binds cloud identity, remote version and downloaded content hash; it is not the content-only hash. Keep the whole returned provenance in manifests. In answers prefer the returned web_url plus actual locator and source_version; a missing URL is not a reason to guess one. Temporary download URLs and authentication material are not citation links.
+
+Every returned list/search page rechecks the current metadata access and etag for each candidate, including cached ranked pages. On success `cloud_access_checked` describes that bounded check; `cloud_access_scope` states its limits. A failed candidate check fails the call instead of returning a stale page. Checks are sequential, not an atomic permission snapshot, and do not replace content verification by inspect/read/context/export. An empty successful search still does not establish business absence.
+
+Graph inventory is paged and bounded; unsuccessful traversal does not publish a complete empty manifest. Unsupported shortcuts/packages, source changes, revoked permissions and limits require their reported handling. Network calls, revalidation and repeated content downloads add cost even with a local index. Missing auth requires explicit user login as described in [requirements](requirements.md), not collection of credentials in chat. No real-tenant permissions or latency guarantee follows from mock tests.
 
 ## Optional retrieval and context
 
@@ -46,7 +56,7 @@ Do not mix these combinations. Unknown fields, reversed ranges and incompatible 
 
 `coverage.inventory_complete` concerns the last inventory traversal. `present_files` counts non-deleted entries; `indexed_files` counts `ready` files; `states` reports all observed states; `all_present_files_indexed` requires completed inventory and every present file ready. `partial_files` and `all_present_files_extracted_completely` distinguish ready partial extractions from complete text coverage. `business_completeness` remains `not_established` because a parser cannot establish business authority or missing out-of-root sources.
 
-File states include `ready`, `pending`, `failed`, `blocked`, `unsupported`, `oversized`, `online_only`, `stale` and `deleted`. The `online_only` state reflects a detected operating-system condition, not a comprehensive OneDrive availability check. Inspect/read/context/export require a ready file and validate its whole-content digest. Ready PDF files may still have `extraction_complete: false`; read `content_coverage.missing_text_pages` and other gaps.
+File states include `ready`, `pending`, `failed`, `blocked`, `unsupported`, `oversized`, `online_only`, `stale` and `deleted`. The local provider's `online_only` state reflects a detected operating-system condition, not Microsoft Graph availability. Inspect/read/context/export require a ready file and validate whole content; Graph also verifies remote identity/version around downloads. Ready PDF files may still have `extraction_complete: false`; read `content_coverage.missing_text_pages` and other gaps.
 
 `extraction_complete: true` means extraction finished within supported format scope; it is false for explicit missing-text PDF pages. `content_coverage` gives total/pages-with-text/missing-text pages and `ocr_performed: false`; blank and image-only pages are not automatically distinguished. Read `format_warnings` and segment warnings anyway. `truncated: true` mirrors pagination (`has_more`) in this release: follow `next_cursor` to continue. A final page does not establish complete business coverage.
 
@@ -68,7 +78,7 @@ For a full total: status/refresh → enumerate the defined scope → inspect rel
 
 ## Local diagnostic client
 
-For offline setup inspection use `node scripts/doctor.mjs --config '<config.json>'`; it starts no worker and scans no source files. For live tools use `node scripts/call-tool.mjs tools --config '<config.json>'` or a named tool plus JSON arguments. `--demo` explicitly selects the simulated library. The CLI opens a client session to the managed local service, closes that session on exit, and never implicitly selects a source. Status is immediate; ordinary reads wait up to 60 seconds for initial indexing. A refresh call waits for its job. It does not automatically inspect the configuration of an existing Codex chat.
+For offline setup inspection use `node scripts/doctor.mjs --config '<config.json>'`; it starts no worker and scans no source files. It cannot prove cloud authentication or reachability. For live tools use `node scripts/call-tool.mjs tools --config '<config.json>'` or a named tool plus JSON arguments. `--demo` explicitly selects the simulated library. The CLI opens a client session to the managed local service, closes that session on exit, and never implicitly selects a source. Status does not wait for a full index but a cloud status can require an online source check; ordinary reads wait up to 60 seconds for initial indexing. A refresh call waits for its job. It does not automatically inspect the configuration of an existing Codex chat.
 
 A multi-step workflow with cursors belongs in a persistent MCP session, because cursors are session-bound. Large libraries should use a persistent client rather than repeatedly starting the diagnostic CLI or treating its 60-second startup timeout as an indexing success.
 

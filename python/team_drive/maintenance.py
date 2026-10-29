@@ -75,8 +75,8 @@ def maintain(config_path, apply=False, reset_index=False, prune_exports_days=Non
     """Preview by default. Lease control before index; never delete recursively."""
     config_file = Path(config_path).expanduser().resolve(strict=True)
     config = json.loads(config_file.read_text(encoding="utf-8"))
-    if not isinstance(config, dict) or config.get("provider", "local") != "local":
-        raise DriveError("INVALID_CONFIG", "Use a local source configuration.")
+    if not isinstance(config, dict) or config.get("provider", "local") not in ("local", "microsoft_graph"):
+        raise DriveError("INVALID_CONFIG", "Use an explicit local or Microsoft Graph source configuration.")
     for key in ("root", "state_dir"):
         if not isinstance(config.get(key), str) or not config[key]:
             raise DriveError("INVALID_CONFIG", "root and state_dir must be nonempty paths.")
