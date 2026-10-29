@@ -4,11 +4,13 @@
 
 新增 Microsoft Graph 单文件夹来源、显式设备码登录与静默刷新、按需下载解析、云端原始链接及版本引用。本地来源和 13 个 MCP 工具保持兼容。检索候选及可选模型输入前核验云端访问和 etag；证据读取另行下载并校验内容。部分枚举、断网、撤权和限流不能作为空目录或成功的离线证据。
 
-本地 macOS、Node.js 26.9.0、Python 3.9.6：Python 257 项中 250 项通过、7 项 Windows 专项跳过。新增 51 项覆盖 Graph 来源、OAuth/缓存和真实 Engine/解析/存储。安装器 36/36、doctor 8/8、云配置 17/17（含 123 组 JS/Python 一致性场景）、Backend 3/3；TypeScript 构建、Skill 官方格式校验通过。`npm run evaluate -- --output .local/evaluation-v05.json` 的合成评测 14/14 通过，不代表 LLM 回答准确率。
+本地 macOS、Node.js 26.9.0、Python 3.9.6：Python 263 项中 256 项通过、7 项 Windows 专项跳过。新增 56 项覆盖 Graph 来源、OAuth/缓存和真实 Engine/解析/存储。安装器 36/36、doctor 8/8、云配置 17/17（含 123 组 JS/Python 一致性场景）、Backend 3/3；TypeScript 构建、Skill 官方格式校验通过。`npm run evaluate -- --output .local/evaluation-v05.json` 的合成评测 14/14 通过，不代表 LLM 回答准确率。
 
 `npm run test:cloud` 通过真实 SDK stdio → bridge → broker → Engine → parser/storage 链路验证 13 工具、来源与版本、导出和证据包、403 缓存拒绝、503 不误删、缺少授权及空 anchor。测试注入合成 Graph 响应并禁止真实 HTTP，不访问 Microsoft 租户。原本地 MCP、六客户端并发/崩溃恢复、完整安装与索引重用均通过。
 
 GitHub CI 已配置 Windows/macOS/Linux 与 Python 3.9/3.13，增加云配置和云 MCP 测试；具体提交的执行结果以 Actions 为准。尚未在真实租户验证企业同意、条件访问、设备码策略或网络出口；公司 OneDrive/SharePoint 的实际接入须按[云盘验收步骤](CLOUD_DRIVE.md)完成。当前仍是单个本机用户的 stdio 服务，不提供团队 HTTP 服务或多用户身份隔离；不新增 SMB/UNC、OCR 或云文件写入。
+
+跨平台 CI 追加修复：Graph 的七位小数时间在 Python 3.9 保留纳秒精度；OAuth/Graph/模型响应采用统一 JSON 深度上限；Windows 评测路径使用 POSIX 相对路径；Windows 索引元数据改用创建时间，避免 [CPython stat/fstat ctime 差异](https://github.com/python/cpython/issues/157671)导致无变化时反复索引，实际内容读取的校验保持。并发首次登录对 macOS 瞬时 ENOENT 仅作有界重验重试，链接与权限错误仍拒绝；云任务测试等待实际终态，模型批次预算测试使用确定时钟，避免依赖 CI 主机调度速度。
 
 ## 0.4.0 / 2026-10-29：证据上下文、检索与可重复评测
 

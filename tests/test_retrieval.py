@@ -10,7 +10,7 @@ from pathlib import Path
 from unittest import mock
 
 from team_drive.errors import DriveError
-from team_drive.retrieval import Retrieval, _default_tokens, validate_config
+from team_drive.retrieval import Retrieval, _ModelFailure, _default_tokens, validate_config
 
 
 class FakeModel:
@@ -343,18 +343,44 @@ class RetrievalTests(unittest.TestCase):
 
     def test_per_file_budget_preserves_completed_batches_and_resume(self):
         add_file(self.db, "a", ["synthetic first", "synthetic second", "synthetic third"])
-        value = self.retrieval(batch_size=1, per_file_budget_seconds=0.15)
-        self.model.delay = 0.09
-        started = time.monotonic()
-        result = value.index_file(self.db, "a", "v1")
-        self.assertLess(time.monotonic() - started, 0.5)
-        self.assertEqual(result["state"], "partial")
-        self.assertEqual(result["newly_indexed_segments"], 1)
-        self.assertEqual(result["error_code"], "MODEL_BUDGET_EXCEEDED")
-        self.model.delay = 0
-        result = value.index_file(self.db, "a", "v1")
-        self.assertEqual(result["state"], "ready")
-        self.assertEqual(result["newly_indexed_segments"], 2)
+        value = self.retrieval(batch_size=1, per_file_budget_seconds=1)
+        now = 100.0
+        batch_duration = 0.625
+        requests = []
+
+        def timed_response(_options, payload, deadline=None):
+            nonlocal now
+            self.assertIsNotNone(deadline)
+            requests.append(tuple(payload["input"]))
+            # Model transport consumes a deterministic budget: the first batch
+            # completes, while the second reaches the shared file deadline.
+            now = min(now + batch_duration, deadline)
+            if now >= deadline:
+                raise _ModelFailure("MODEL_BUDGET_EXCEEDED")
+            return {"data": [{"index": index, "embedding": [1.0, 0.0]}
+                             for index in range(len(payload["input"]))]}
+
+        with mock.patch("team_drive.retrieval.time.monotonic", side_effect=lambda: now), \
+                mock.patch("team_drive.retrieval._post", side_effect=timed_response):
+            result = value.index_file(self.db, "a", "v1")
+            self.assertEqual(result["state"], "partial")
+            self.assertEqual(result["newly_indexed_segments"], 1)
+            self.assertEqual(result["indexed_segments"], 1)
+            self.assertEqual(result["error_code"], "MODEL_BUDGET_EXCEEDED")
+            self.assertEqual(now, 101.0)
+            retained = self.db.execute("SELECT * FROM retrieval_vectors WHERE ordinal=0").fetchone()
+            self.assertIsNotNone(retained)
+            self.assertEqual(requests, [("synthetic first",), ("synthetic second",)])
+
+            batch_duration = 0.25
+            result = value.index_file(self.db, "a", "v1")
+            self.assertEqual(result["state"], "ready")
+            self.assertEqual(result["newly_indexed_segments"], 2)
+            self.assertEqual(result["indexed_segments"], 3)
+            self.assertIsNone(result["error_code"])
+            self.assertEqual(self.db.execute("SELECT * FROM retrieval_vectors WHERE ordinal=0").fetchone(), retained)
+            self.assertEqual(requests[2:], [("synthetic second",), ("synthetic third",)])
+        self.assertEqual(self.model.requests, [])
 
     def test_model_revision_pinning_is_reported_without_claiming_weight_detection(self):
         value = self.retrieval()

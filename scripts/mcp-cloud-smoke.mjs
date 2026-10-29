@@ -100,6 +100,19 @@ async function ready(client) {
   throw new Error('Synthetic cloud inventory did not become ready.');
 }
 
+async function finishedJob(client, jobId) {
+  const terminal = new Set(['complete', 'failed', 'cancelled', 'interrupted']);
+  let lastStatus;
+  for (let attempt = 0; attempt < 300; attempt++) {
+    const result = await call(client, 'job_status', { job_id: jobId });
+    lastStatus = result.job.status;
+    if (terminal.has(lastStatus)) return result;
+    assert.ok(['queued', 'running'].includes(lastStatus), `Unexpected job status: ${lastStatus}`);
+    await delay(100);
+  }
+  throw new Error(`Synthetic cloud job did not finish; last status: ${lastStatus}`);
+}
+
 async function stopped() {
   for (let attempt = 0; attempt < 150; attempt++) {
     if (states.every(state => !existsSync(join(state, 'shared-v1/control/endpoint.json')))) return;
@@ -169,7 +182,7 @@ try {
   writeFileSync(control, '{}');
   const refresh = await call(client, 'refresh', { force: true });
   await ready(client);
-  const job = await call(client, 'job_status', { job_id: refresh.job_id });
+  const job = await finishedJob(client, refresh.job_id);
   assert.equal(job.job.status, 'complete');
   writeFileSync(control, JSON.stringify({ mode: 'offline' }));
   const offline = await call(client, 'search', { query: marker }, false);

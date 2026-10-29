@@ -139,7 +139,7 @@ def run_evaluation(mode="keyword", retrieval_config=None, k=5, repetitions=3, re
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_bytes(content.encode("utf-8"))
         _mixed_pdf(source / "mixed.pdf")
-        initial_hashes = {str(p.relative_to(source)): hashlib.sha256(p.read_bytes()).hexdigest()
+        initial_hashes = {p.relative_to(source).as_posix(): hashlib.sha256(p.read_bytes()).hexdigest()
                           for p in source.rglob("*") if p.is_file()}
         config = {"provider": "local", "root": str(source), "state_dir": str(base / "state"), "poll_seconds": 3600}
         if retrieval_config is not None:
@@ -293,7 +293,7 @@ def run_evaluation(mode="keyword", retrieval_config=None, k=5, repetitions=3, re
             check("enumerated_versioned_exports_decimal_total", lambda: measured("export_and_calculate", aggregate))
 
             def unchanged_sources():
-                after = {str(p.relative_to(source)): hashlib.sha256(p.read_bytes()).hexdigest()
+                after = {p.relative_to(source).as_posix(): hashlib.sha256(p.read_bytes()).hexdigest()
                          for p in source.rglob("*") if p.is_file()}
                 _require(after == initial_hashes, "Read/index/export modified source bytes")
                 return {"files": len(after), "source_bytes_unchanged": True}

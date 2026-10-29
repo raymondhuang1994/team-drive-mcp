@@ -29,6 +29,7 @@ import uuid
 
 from .errors import DriveError
 from .fs_access import validate_state_location
+from .bounded_json import loads as bounded_json_loads
 
 
 _AUTHORITY = "https://login.microsoftonline.com"
@@ -153,7 +154,7 @@ def _request(tenant, action, fields, timeout):
             size += len(chunk)
         if size > _MAX_BYTES:
             raise ValueError()
-        value = json.loads(b"".join(chunks))
+        value = bounded_json_loads(b"".join(chunks))
         if not isinstance(value, dict):
             raise ValueError()
         if value.get("error"):
@@ -322,7 +323,7 @@ class _CacheDirectory:
                 raise _error("AUTH_CACHE_UNSAFE", "This credential cache is not protected for the current Windows user.")
             data = _dpapi(data[5:], decrypt=True)
         try:
-            value = json.loads(data)
+            value = bounded_json_loads(data)
             if not isinstance(value, dict):
                 raise ValueError()
             return value
@@ -399,7 +400,18 @@ class _CacheDirectory:
                 if info.st_size == 0:
                     os.write(fd, b"0")
             else:
-                fd = os.open(".auth.lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600, dir_fd=self.fd)
+                # macOS may return transient ENOENT when concurrent O_CREAT |
+                # O_NOFOLLOW calls first create this entry. Keep the directory
+                # pinned and retry only that error; links and permissions still
+                # fail immediately, and a changed directory is never retried.
+                for attempt in range(3):
+                    try:
+                        fd = os.open(".auth.lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600, dir_fd=self.fd)
+                        break
+                    except FileNotFoundError:
+                        self.check()
+                        if attempt == 2:
+                            raise
                 info = os.fstat(fd)
                 if (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_uid != os.getuid() or
                         stat.S_IMODE(info.st_mode) & 0o077):
@@ -517,7 +529,7 @@ def _identity_from_response(response, config):
         if not isinstance(token, str) or len(token) > 131072 or len(token.split(".")) != 3:
             raise ValueError()
         part = token.split(".")[1]
-        claims = json.loads(base64.urlsafe_b64decode(part + "=" * (-len(part) % 4)))
+        claims = bounded_json_loads(base64.urlsafe_b64decode(part + "=" * (-len(part) % 4)))
         tenant, account = _uuid(claims["tid"]), _uuid(claims["oid"])
         if claims.get("aud") != config["client_id"] or claims.get("iss") != _AUTHORITY + "/" + tenant + "/v2.0":
             raise ValueError()
@@ -706,7 +718,7 @@ def main(argv=None):
             raw = source.read(_MAX_BYTES + 1)
         if len(raw) > _MAX_BYTES:
             raise ValueError()
-        config = json.loads(raw)
+        config = bounded_json_loads(raw)
         graph = config["graph"]
         cache = graph.get("auth_cache")
         if not isinstance(cache, str) or not cache:

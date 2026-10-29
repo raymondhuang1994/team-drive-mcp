@@ -1,6 +1,7 @@
 """Synthetic Microsoft OAuth responses; these tests never contact Microsoft."""
 import base64
 import contextlib
+import errno
 import io
 import json
 import os
@@ -15,6 +16,7 @@ from unittest import mock
 
 from team_drive.errors import DriveError
 from team_drive import graph_auth as auth
+from team_drive import bounded_json
 
 
 TENANT = "11111111-1111-1111-1111-111111111111"
@@ -53,6 +55,35 @@ class FakeResponse:
 
     def close(self):
         self.body.close()
+
+
+class BoundedJSONTests(unittest.TestCase):
+    def test_container_depth_has_a_fixed_boundary(self):
+        for opening, closing in (("[", "]"), ('{"nested":', "}")):
+            with self.subTest(opening=opening):
+                bounded_json.loads(opening * 64 + "0" + closing * 64)
+                with self.assertRaises(ValueError):
+                    bounded_json.loads(opening * 65 + "0" + closing * 65)
+        self.assertEqual(bounded_json.loads('{"items":[{},[]]}', max_depth=3), {"items": [{}, []]})
+        with self.assertRaises(ValueError):
+            bounded_json.loads('{"items":[{},[]]}', max_depth=2)
+
+    def test_scalars_empty_containers_and_invalid_limits(self):
+        self.assertEqual(bounded_json.loads("42", max_depth=0), 42)
+        self.assertIsNone(bounded_json.loads("null", max_depth=0))
+        for value in ("[]", "{}"):
+            with self.assertRaises(ValueError):
+                bounded_json.loads(value, max_depth=0)
+            bounded_json.loads(value, max_depth=1)
+        for limit in (-1, True, 1.5, "64", None):
+            with self.subTest(limit=limit), self.assertRaises(ValueError):
+                bounded_json.loads("{}", max_depth=limit)
+
+    def test_decoder_recursion_error_is_normalized(self):
+        with mock.patch.object(bounded_json.json, "loads", side_effect=RecursionError("version-dependent decoder limit")), \
+             self.assertRaises(ValueError) as error:
+            bounded_json.loads("[]")
+        self.assertNotIn("version-dependent", str(error.exception))
 
 
 class GraphAuthTests(unittest.TestCase):
@@ -237,6 +268,56 @@ class GraphAuthTests(unittest.TestCase):
         self.assertEqual(sorted(item[0] for item in outcomes), ["AUTH_ACCOUNT_MISMATCH", "ok"])
         expected = next(binding for state, binding in outcomes if state == "ok")
         self.assertEqual(auth.TokenProvider(CONFIG, self.cache).account_binding, expected)
+
+    @unittest.skipIf(os.name == "nt", "POSIX O_CREAT/O_NOFOLLOW race; Windows uses guarded handles")
+    def test_publication_lock_retries_only_transient_missing_entry(self):
+        directory = auth._CacheDirectory(self.cache, create=True)
+        original_open = os.open
+        try:
+            attempts = []
+
+            def transient_open(name, *args, **kwargs):
+                if name == ".auth.lock":
+                    attempts.append(name)
+                    if len(attempts) <= 2:
+                        raise FileNotFoundError(errno.ENOENT, "Synthetic first-create race")
+                return original_open(name, *args, **kwargs)
+
+            with mock.patch.object(auth.os, "open", side_effect=transient_open), \
+                 mock.patch.object(directory, "check", wraps=directory.check) as check:
+                with directory.publication_lock(1):
+                    self.assertEqual(len(attempts), 3)
+                self.assertGreaterEqual(check.call_count, 4)
+
+            for failure, expected_attempts in ((FileNotFoundError(errno.ENOENT, "still missing"), 3),
+                                               (OSError(errno.ELOOP, "symlink"), 1),
+                                               (PermissionError(errno.EACCES, "denied"), 1)):
+                with self.subTest(failure=failure), mock.patch.object(auth.os, "open", side_effect=failure) as opened, \
+                     self.assertRaises(DriveError) as error:
+                    with directory.publication_lock(1):
+                        self.fail("Unsafe or inaccessible lock must never be acquired")
+                self.assertEqual(error.exception.code, "AUTH_CACHE_UNSAFE")
+                self.assertEqual(opened.call_count, expected_attempts)
+        finally:
+            directory.close()
+
+    @unittest.skipIf(os.name == "nt", "POSIX O_CREAT/O_NOFOLLOW race; Windows uses guarded handles")
+    def test_publication_lock_does_not_retry_after_directory_replacement(self):
+        directory = auth._CacheDirectory(self.cache, create=True)
+        displaced = self.cache.parent.with_name("displaced")
+        try:
+            def replace_directory(*args, **kwargs):
+                self.cache.parent.rename(displaced)
+                self.cache.parent.mkdir(mode=0o700)
+                raise FileNotFoundError(errno.ENOENT, "Synthetic replaced-directory race")
+
+            with mock.patch.object(auth.os, "open", side_effect=replace_directory) as opened, self.assertRaises(DriveError) as error:
+                with directory.publication_lock(1):
+                    self.fail("A changed credential directory must never be accepted")
+            self.assertEqual(error.exception.code, "AUTH_CACHE_UNSAFE")
+            opened.assert_called_once()
+        finally:
+            directory.close()
 
     def test_running_provider_rejects_disk_account_switch_before_using_memory_token(self):
         self.login()

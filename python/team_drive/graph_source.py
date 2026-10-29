@@ -21,6 +21,7 @@ from datetime import datetime, timezone
 from types import SimpleNamespace
 
 from .errors import DriveError
+from .bounded_json import loads as bounded_json_loads
 from .fs_access import SourceAccess
 
 
@@ -219,7 +220,7 @@ class GraphSource:
         with self._open(url, deadline) as response:
             raw = b"".join(self._chunks(response, deadline, _JSON_LIMIT))
         try:
-            result = json.loads(raw)
+            result = bounded_json_loads(raw)
         except (ValueError, UnicodeError, RecursionError):
             _fail("GRAPH_INVALID_RESPONSE", "The cloud response is not a bounded valid JSON object.", True)
         if not isinstance(result, dict):

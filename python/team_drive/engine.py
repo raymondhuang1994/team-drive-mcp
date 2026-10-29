@@ -585,6 +585,13 @@ class Engine:
     def _fingerprint(info):
         return (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
 
+    @staticmethod
+    def _inventory_time(info):
+        # Windows stat/fstat ctime semantics differ in recent CPython versions.
+        # Use creation time for the inventory cache, as older Windows Python did;
+        # keep the live descriptor fingerprint and content digest checks intact.
+        return getattr(info, "st_birthtime_ns", info.st_ctime_ns) if os.name == "nt" else info.st_ctime_ns
+
     def _digest(self, rel, snapshot=None):
         if self._cloud_binding:
             return self._source.digest(rel, snapshot)
@@ -1157,12 +1164,12 @@ class Engine:
                         (initial != "pending" and old["status"] == initial and
                          old["error_code"] == reason[0] and old["error_message"] == reason[1]))
                     unchanged = (stable_state and old["size"] == info.st_size and
-                                 old["mtime_ns"] == info.st_mtime_ns and old["ctime_ns"] == info.st_ctime_ns and
+                                 old["mtime_ns"] == info.st_mtime_ns and old["ctime_ns"] == self._inventory_time(info) and
                                  not force)
                     if unchanged:
                         db.execute("UPDATE files SET seen_scan=? WHERE id=?", (scan_id, file_id))
                     else:
-                        db.execute("INSERT INTO files(id,path,suffix,size,mtime_ns,ctime_ns,status,error_code,error_message,seen_scan,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET path=excluded.path,suffix=excluded.suffix,size=excluded.size,mtime_ns=excluded.mtime_ns,ctime_ns=excluded.ctime_ns,status=excluded.status,error_code=excluded.error_code,error_message=excluded.error_message,source_version=NULL,segments_count=0,seen_scan=excluded.seen_scan,updated_at=excluded.updated_at", (file_id, relative, suffix, info.st_size, info.st_mtime_ns, info.st_ctime_ns, initial, reason[0], reason[1], scan_id, time.time()))
+                        db.execute("INSERT INTO files(id,path,suffix,size,mtime_ns,ctime_ns,status,error_code,error_message,seen_scan,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET path=excluded.path,suffix=excluded.suffix,size=excluded.size,mtime_ns=excluded.mtime_ns,ctime_ns=excluded.ctime_ns,status=excluded.status,error_code=excluded.error_code,error_message=excluded.error_message,source_version=NULL,segments_count=0,seen_scan=excluded.seen_scan,updated_at=excluded.updated_at", (file_id, relative, suffix, info.st_size, info.st_mtime_ns, self._inventory_time(info), initial, reason[0], reason[1], scan_id, time.time()))
                         db.execute("DELETE FROM segments WHERE file_id=?", (file_id,))
                         db.execute("DELETE FROM structure WHERE file_id=?", (file_id,))
                         db.execute("DELETE FROM search_index WHERE file_id=?", (file_id,))
@@ -1287,7 +1294,7 @@ class Engine:
                 if group_key is not None:
                     db.execute("INSERT INTO structure VALUES(?,?,?,?,?)", (row["id"], group_position, group_key, group_start, group_end))
                 complete = not content_coverage.get("missing_text_pages")
-                db.execute("UPDATE files SET source_version=?,status='ready',error_code=NULL,error_message=NULL,segments_count=?,size=?,mtime_ns=?,ctime_ns=?,format_warnings=?,extraction_complete=?,content_coverage=?,updated_at=? WHERE id=?", (version, count, current_info.st_size, current_info.st_mtime_ns, current_info.st_ctime_ns, _json(warnings), int(complete), _json(content_coverage), time.time(), row["id"]))
+                db.execute("UPDATE files SET source_version=?,status='ready',error_code=NULL,error_message=NULL,segments_count=?,size=?,mtime_ns=?,ctime_ns=?,format_warnings=?,extraction_complete=?,content_coverage=?,updated_at=? WHERE id=?", (version, count, current_info.st_size, current_info.st_mtime_ns, self._inventory_time(current_info), _json(warnings), int(complete), _json(content_coverage), time.time(), row["id"]))
                 if self._cloud_binding:
                     origin = self._source.evidence(row["path"])
                     if origin.get("source_version") != version:

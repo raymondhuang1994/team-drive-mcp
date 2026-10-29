@@ -19,6 +19,7 @@ import urllib.parse
 import urllib.request
 
 from .errors import DriveError
+from .bounded_json import loads as bounded_json_loads
 
 
 _MAX_RESPONSE_BYTES = 8 * 1024 * 1024
@@ -161,7 +162,7 @@ def _post(options, payload, deadline=None):
             body = b"".join(chunks)
         if len(body) > _MAX_RESPONSE_BYTES:
             raise _ModelFailure("MODEL_RESPONSE_TOO_LARGE")
-        value = json.loads(body)
+        value = bounded_json_loads(body)
         if not isinstance(value, dict):
             raise _ModelFailure("MODEL_INVALID_RESPONSE")
         return value
