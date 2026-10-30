@@ -85,8 +85,8 @@ class Engine:
             config = copy.deepcopy(config_snapshot) if config_snapshot is not None else json.loads(config_file.read_text(encoding="utf-8"))
         except (ValueError, OSError):
             raise DriveError("INVALID_CONFIG", "Configuration must be valid UTF-8 JSON.")
-        if not isinstance(config, dict) or config.get("provider", "local") not in ("local", "microsoft_graph"):
-            raise DriveError("UNSUPPORTED_PROVIDER", "Use local or microsoft_graph with an explicit source configuration.")
+        if not isinstance(config, dict) or config.get("provider", "local") not in ("local", "microsoft_graph", "windows_share"):
+            raise DriveError("UNSUPPORTED_PROVIDER", "Use local, windows_share or microsoft_graph with an explicit source configuration.")
         self.provider = config.get("provider", "local")
         for key in ("root", "state_dir"):
             if not isinstance(config.get(key), str) or not config[key]:
@@ -118,14 +118,19 @@ class Engine:
         self._query_lock = threading.RLock()
         max_slots = pool_settings(config)
         parser_signature = hashlib.sha256(Path(__file__).with_name("extract.py").read_bytes()).hexdigest()
-        indexer_signature = hashlib.sha256(Path(__file__).read_bytes() + Path(__file__).with_name("fs_access.py").read_bytes()).hexdigest()
+        indexer_signature = hashlib.sha256(Path(__file__).read_bytes() + Path(__file__).with_name("fs_access.py").read_bytes()
+                                           + Path(__file__).with_name("network_source.py").read_bytes()).hexdigest()
         self._parse_binding = hashlib.sha256(_json({"parser": parser_signature, "indexer": indexer_signature, "limits": self.limits, "aliases": self.aliases, "schema": 4}).encode()).hexdigest()
         raw_state = Path(config["state_dir"] if state_override is None else state_override).expanduser()
         raw_state = raw_state if raw_state.is_absolute() else config_file.parent / raw_state
         validate_state_location(raw_state)
-        raw_root = Path(config["root"]).expanduser()
-        raw_root = raw_root if raw_root.is_absolute() else config_file.parent / raw_root
+        raw_root = config["root"] if self.provider == "windows_share" else Path(config["root"]).expanduser()
+        if self.provider != "windows_share":
+            raw_root = raw_root if raw_root.is_absolute() else config_file.parent / raw_root
         self._cloud_binding = None
+        self._share_binding = None
+        if "windows_share" in config and self.provider != "windows_share":
+            raise DriveError("INVALID_CONFIG", "Shared-folder settings require provider=windows_share.")
         if self.provider == "microsoft_graph":
             from .graph_config import graph_settings, validate_graph_paths, source_binding
             from .graph_auth import TokenProvider
@@ -136,18 +141,34 @@ class Engine:
             self._source = GraphSource(raw_root, graph, self.limits["max_file_bytes"], token_provider=tokens)
             self._cloud_binding = source_binding(graph)
             self._cloud_binding["account_binding"] = tokens.account_binding
+        elif self.provider == "windows_share":
+            from .network_source import WindowsShareSource
+            if "graph" in config:
+                raise DriveError("INVALID_CONFIG", "Graph settings cannot be used for a Windows shared folder.")
+            self._source = WindowsShareSource(raw_root, config.get("windows_share"), self.limits["max_file_bytes"])
+            self._share_binding = self._source.binding
         else:
             if "graph" in config:
                 raise DriveError("INVALID_CONFIG", "Graph settings require provider=microsoft_graph.")
             self._source = SourceAccess(raw_root)
+        self._remote_source = bool(self._cloud_binding or self._share_binding)
         self.root = self._source.root
         self._root_identity = self._source.identity
         self._storage = None
         self._lease = None
         try:
+            approved_identity = config.get("approved_source_identity")
+            if approved_identity is not None:
+                current_identity = (self._share_binding if self.provider == "windows_share" else
+                                    {"provider": "local", "device": self._root_identity[0], "inode": self._root_identity[1]})
+                if self.provider == "microsoft_graph" or not isinstance(approved_identity, dict) or approved_identity != current_identity:
+                    raise DriveError("APPROVED_SOURCE_CHANGED", "The source identity differs from the confirmed setup, before indexing could start.", False,
+                                     "Review the actual folder and create a new configuration plan; do not delete the identity binding.")
             root_binding = {"path": str(self.root), "identity": self._root_identity}
             if self._cloud_binding:
                 root_binding["cloud"] = self._cloud_binding
+            if self._share_binding:
+                root_binding["share"] = self._share_binding
             self._root_binding = hashlib.sha256(_json(root_binding).encode()).hexdigest()
             installation = Path(__file__).resolve().parents[2]
             if pooled:
@@ -307,7 +328,7 @@ class Engine:
                 "all_present_files_indexed": inventory and present == counts.get("ready", 0),
                 "partial_files": partial,
                 "all_present_files_extracted_completely": inventory and present == counts.get("ready", 0) and partial == 0,
-                "scope": "Configured cloud folder; remote version and content checked before evidence reads." if self._cloud_binding else "Configured local root; content freshness is revalidated before evidence reads.",
+                "scope": "Configured remote folder; current access and version checked before returning cached candidates or evidence." if self._remote_source else "Configured local root; content freshness is revalidated before evidence reads.",
                 "business_completeness": "not_established"}
 
     def _file_out(self, row):
@@ -324,7 +345,7 @@ class Engine:
 
     def _verify_cloud_page(self, result, deadline=None):
         """Recheck access and remote version before exposing cached cloud candidates."""
-        if not self._cloud_binding:
+        if not self._remote_source:
             return result
         deadline = deadline if deadline is not None else time.monotonic() + 30
         for item in result["files"]:
@@ -333,19 +354,24 @@ class Engine:
             except DriveError as exc:
                 with self._db() as db:
                     db.execute("UPDATE meta SET value='false' WHERE key='inventory_complete'")
-                if exc.code in ("GRAPH_SOURCE_CHANGED", "GRAPH_SCOPE_CHANGED", "GRAPH_ACCESS_DENIED", "GRAPH_ITEM_UNAVAILABLE"):
+                if self._share_binding or exc.code in ("GRAPH_SOURCE_CHANGED", "GRAPH_SCOPE_CHANGED", "GRAPH_ACCESS_DENIED", "GRAPH_ITEM_UNAVAILABLE"):
                     self._invalidate(item["file_id"], exc.code, exc.message,
                                      expected_version=item.get("source_version"))
                 raise
-        result["cloud_access_checked"] = True
-        result["cloud_access_scope"] = "Returned candidates checked sequentially; not a live atomic permission snapshot of the whole folder."
+        name = "share" if self._share_binding else "cloud"
+        result[name + "_access_checked"] = True
+        result[name + "_access_scope"] = "Returned candidates checked sequentially; not an atomic permission snapshot of the whole folder. Windows server/OS authorization semantics apply to shared folders."
         return result
 
     def _verify_cloud_hits(self, db, hits, deadline):
-        if not self._cloud_binding:
+        if not self._remote_source:
             return
-        files = []
+        files, seen = [], set()
         for hit in hits:
+            identity = (hit["file_id"], hit["source_version"])
+            if identity in seen:
+                continue
+            seen.add(identity)
             row = db.execute("SELECT * FROM files WHERE id=? AND source_version=? AND status='ready'",
                              (hit["file_id"], hit["source_version"])).fetchone()
             if row is None:
@@ -418,17 +444,18 @@ class Engine:
                                           checkpoint_at=self._checkpoint_at),
                     "source_id": self._root_binding,
                     "cloud_source": self._cloud_binding,
+                    "shared_source": self._share_binding,
                     "indexer_health": "healthy" if self._thread is not None else "manual",
                     "current_job_id": self._pending_job,
                     "search_mode": "keyword_with_aliases_and_bm25",
                     "retrieval": self.retrieval.status(db),
                     "capabilities": {"versioned_context": True, "evidence_plan": True,
                                      "diagnostics": True, "search_modes": ["keyword", "hybrid", "semantic"],
-                                     "ocr": False, "network_source": bool(self._cloud_binding),
-                                     "source_providers": ["local", "microsoft_graph"], "http_mcp": False},
+                                     "ocr": False, "network_source": self._remote_source,
+                                     "source_providers": ["local", "windows_share", "microsoft_graph"], "http_mcp": False},
                     "diagnostics": dict(self.diagnostic_settings, write_failures=self._diagnostic_failures),
                     "freshness": "Metadata checked during scans; full digest checked for inspect/read/export.",
-                    "network_calls": bool(self._cloud_binding or self.retrieval.config.get("semantic", {}).get("enabled") or
+                    "network_calls": bool(self._remote_source or self.retrieval.config.get("semantic", {}).get("enabled") or
                                           self.retrieval.config.get("rerank", {}).get("enabled")),
                     "read_only_sources": True}
 
@@ -562,7 +589,7 @@ class Engine:
         try:
             self._source.check_root()
         except DriveError:
-            if self._cloud_binding:
+            if self._remote_source:
                 with self._db() as db:
                     old = db.execute("SELECT value FROM meta WHERE key='inventory_complete'").fetchone()
                     if old and old[0] == "true":
@@ -590,10 +617,12 @@ class Engine:
         # Windows stat/fstat ctime semantics differ in recent CPython versions.
         # Use creation time for the inventory cache, as older Windows Python did;
         # keep the live descriptor fingerprint and content digest checks intact.
+        if hasattr(info, "st_network_change_ns"):
+            return info.st_network_change_ns
         return getattr(info, "st_birthtime_ns", info.st_ctime_ns) if os.name == "nt" else info.st_ctime_ns
 
     def _digest(self, rel, snapshot=None):
-        if self._cloud_binding:
+        if self._remote_source:
             return self._source.digest(rel, snapshot)
         fd, before = self._open_source(rel)
         digest = hashlib.sha256()
@@ -646,7 +675,7 @@ class Engine:
         try:
             version, _ = self._digest(row["path"])
         except DriveError as exc:
-            if self._cloud_binding and exc.code.startswith(("GRAPH_", "AUTH_")):
+            if self._remote_source and exc.code.startswith(("GRAPH_", "AUTH_", "SHARE_")):
                 # Preserve the last parsed snapshot for recovery, but never serve it
                 # as verified evidence when cloud access/version checks fail.
                 with self._db() as db:
@@ -1057,7 +1086,7 @@ class Engine:
         manifest = {
             "schema": "df-mcp-evidence-bundle-v1", "created_at": self._utc_now(),
             "source": {"provider": self.provider, "root": None if self._cloud_binding else str(self.root),
-                       "cloud": self._cloud_binding, "source_id": self._root_binding,
+                       "cloud": self._cloud_binding, "share": self._share_binding, "source_id": self._root_binding,
                        "root_identity": list(self._root_identity)},
             "scope": {"selection": "exactly_explicit_file_ids", "description": scope_description,
                       "description_authority": "user_supplied_not_verified", "requested_files": len(files)},
@@ -1127,9 +1156,10 @@ class Engine:
     def scan_once(self, job_id=None, force=False):
         """Synchronous scan used by the worker thread and deterministic tests."""
         started = time.perf_counter()
-        if self._cloud_binding:
+        if self._remote_source:
             self._check_health()
-            self._source.check_local_root()
+            if self._cloud_binding:
+                self._source.check_local_root()
             self._storage.check()
         else:
             self._check_root()
@@ -1165,6 +1195,8 @@ class Engine:
                          old["error_code"] == reason[0] and old["error_message"] == reason[1]))
                     unchanged = (stable_state and old["size"] == info.st_size and
                                  old["mtime_ns"] == info.st_mtime_ns and old["ctime_ns"] == self._inventory_time(info) and
+                                 (not self._share_binding or json.loads(old["origin"]).get("file_identity") ==
+                                  self._source.evidence(relative).get("file_identity")) and
                                  not force)
                     if unchanged:
                         db.execute("UPDATE files SET seen_scan=? WHERE id=?", (scan_id, file_id))
@@ -1175,7 +1207,7 @@ class Engine:
                         db.execute("DELETE FROM search_index WHERE file_id=?", (file_id,))
                         self.retrieval.delete_file(db, file_id)
                         db.execute("UPDATE files SET origin=? WHERE id=?", (
-                            _json(self._source.evidence(relative)) if self._cloud_binding else "{}", file_id))
+                            _json(self._source.evidence(relative)) if self._remote_source else "{}", file_id))
                         db.execute("INSERT INTO search_index(tokens,file_id,ordinal) VALUES(?,?,-1)", (" ".join(tokenize(relative)), file_id))
                         self._bump(db)
                 discovered += 1
@@ -1295,7 +1327,7 @@ class Engine:
                     db.execute("INSERT INTO structure VALUES(?,?,?,?,?)", (row["id"], group_position, group_key, group_start, group_end))
                 complete = not content_coverage.get("missing_text_pages")
                 db.execute("UPDATE files SET source_version=?,status='ready',error_code=NULL,error_message=NULL,segments_count=?,size=?,mtime_ns=?,ctime_ns=?,format_warnings=?,extraction_complete=?,content_coverage=?,updated_at=? WHERE id=?", (version, count, current_info.st_size, current_info.st_mtime_ns, self._inventory_time(current_info), _json(warnings), int(complete), _json(content_coverage), time.time(), row["id"]))
-                if self._cloud_binding:
+                if self._remote_source:
                     origin = self._source.evidence(row["path"])
                     if origin.get("source_version") != version:
                         raise DriveError("SOURCE_CHANGED", "The cloud evidence metadata changed during parsing.", True, "Refresh and retry.")

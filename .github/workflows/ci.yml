@@ -50,6 +50,8 @@ jobs:
       - run: npm run test:cloud-configure
       - run: npm run test:backend
       - run: npm test
+        env:
+          DF_MCP_TEST_SMB: ${{ runner.os == 'Windows' && '1' || '0' }}
       - run: npm run evaluate -- --output .local/evaluation-ci.json
       - run: npm run test:mcp
       - run: npm run test:cloud

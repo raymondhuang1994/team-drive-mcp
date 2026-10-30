@@ -2,8 +2,10 @@
 
 [![Windows, macOS and Linux validation](https://github.com/raymondhuang1994/team-drive-mcp/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/raymondhuang1994/team-drive-mcp/actions/workflows/ci.yml)
 
-给 AI 使用的团队文件读取工具，支持普通本地目录，以及显式配置的 OneDrive/SharePoint 云盘文件夹。Skill 名称为 **`df-mcp`**，界面名称为 **df mcp**；GitHub 仓库仍使用 `team-drive-mcp`。架构：**Skill + 本机 MCP + SQLite 增量索引**。优先保证来源、版本和读取范围可核查，再优化定位速度。所有附带业务数据均为 **SIMULATED / 完全虚构**。
+给 AI 使用的团队文件读取工具，支持普通本地目录、显式配置的 Windows 网络公盘，以及 OneDrive/SharePoint 云盘文件夹。Skill 名称为 **`df-mcp`**，界面名称为 **df mcp**；GitHub 仓库仍使用 `team-drive-mcp`。架构：**Skill + Python 工具入口 / 本机 MCP + SQLite 增量索引**。优先保证来源、版本和读取范围可核查，再优化定位速度。所有附带业务数据均为 **SIMULATED / 完全虚构**。
 
+- [0.6 完整 Skill ZIP、两选项初始化与网络公盘](docs/UPGRADE_0_6.md)
+- [给同事的安装说明](skills/df-mcp/INSTALL.md)
 - [0.5 OneDrive/SharePoint 配置、登录与验收](docs/CLOUD_DRIVE.md)
 - [0.4 本地升级、兼容性与回退](docs/UPGRADE_0_4.md)
 - [可选本地检索模型配置](docs/RETRIEVAL_CONFIGURATION.md)
@@ -16,9 +18,13 @@
 - [10 个固定评估任务](tests/evaluation.xml)
 - [OCR 可行性调查：本轮未实施](docs/OCR_FEASIBILITY.md)
 
-**MCP 服务负责读什么、实际读到了什么以及如何验证；Skill 负责指导 Agent 如何使用这些证据。** 服务提供受限读取、索引、版本、定位和覆盖状态；Skill 指导候选发现、补读上下文、确定统计范围、引用和说明缺口。只更新 Skill 不会增加服务工具，也不会自动获得文件、模型或云盘权限。本文的 0.5 能力以实际连接的 `team_drive_status` 和工具列表为准；历史 CI 徽章及验证记录不能代替本次版本验收。
+**MCP 服务负责读什么、实际读到了什么以及如何验证；Skill 负责指导 Agent 如何使用这些证据。** 服务提供受限读取、索引、版本、定位和覆盖状态；Skill 指导候选发现、补读上下文、确定统计范围、引用和说明缺口。只更新 Skill 不会增加服务工具，也不会自动获得文件、模型或云盘权限。本文的 0.6 能力以实际连接的 `team_drive_status` 和工具列表为准；历史 CI 徽章及验证记录不能代替本次版本验收。
 
 ## 已实现的范围
+
+- 0.6 完整 Skill ZIP：A 团队公盘/云盘、B 本地磁盘；支持回复字母或直接提供路径/微软云盘链接，先预览、确认后创建独立本地状态。
+- Python CLI 与 MCP 共用核心，完整 ZIP 附带固定版本解析依赖（不附带 Python 解释器），无需 Node 即可使用脚本入口。
+- 新增显式 windows_share 来源；使用当前 Windows 身份，索引仍在固定本地磁盘。公司真实 DFS/网络/VPN 场景需单独验收。
 
 - 本机 stdio MCP，13 个结构化工具；默认关键词模式不调用模型。local 来源不访问网络；microsoft_graph 来源需要访问微软授权与文件接口。
 - 0.5 实现 Microsoft Graph 的 OneDrive/SharePoint 文件夹枚举、内容读取、显式设备登录和认证缓存。接口已实现，**尚未完成真实租户验收**；账号权限、企业策略和实际文件必须单独验证。
@@ -34,9 +40,15 @@
 - 多个 stdio 连接共享一个受管理的本地索引服务；状态目录禁止位于 `.codex` 或 `CODEX_HOME` 下。
 - 授权根目录边界、符号链接/Windows junction 与 reparse 路径拒绝、压缩文件/XML 限制、超时、明确错误。
 
-**运行平台：Windows、macOS / Linux，Node.js >=22，Python >=3.9。** Windows 的本地来源和本机状态面向固定本地磁盘上的普通目录，支持中文及空格路径；不支持 UNC/网络映射盘、可移动盘、设备路径、junction、符号链接及其他 reparse 路径。Graph 云盘来源通过 API 读取，不依赖 OneDrive 本地同步目录。目标为 Windows 10/11；自动测试的实际环境与结果见验证记录，不能据此宣称所有公司电脑已经验收。
+**运行平台：Windows、macOS / Linux，Python >=3.9；原 MCP 入口另需 Node.js >=22。windows_share 仅 Windows。** Windows 的本地来源和本机状态面向固定本地磁盘上的普通目录，支持中文及空格路径；local 来源仍拒绝 UNC/网络映射盘、可移动盘、设备路径、junction、符号链接及其他 reparse 路径；网络公盘使用单独的 windows_share 来源，不能靠放宽 local 限制接入。Graph 云盘来源通过 API 读取，不依赖 OneDrive 本地同步目录。目标为 Windows 10/11；自动测试的实际环境与结果见验证记录，不能据此宣称所有公司电脑已经验收。
 
-**当前未实现：** SMB/NFS 共享盘连接器或镜像同步、远程 HTTP MCP 服务、多用户后台与员工权限同步、OCR、原始文件下载 MCP 工具、模型自我训练、无人值守云端部署。本版仍是同机 stdio 客户端共享服务；Graph 和可选模型的 HTTP 请求不等于对团队开放 HTTP MCP。没有真实团队资料，也没有公司 PPT 模板。
+**当前未实现：** NFS 连接器或镜像同步、远程 HTTP MCP 服务、多用户后台与员工权限同步、OCR、原始文件下载 MCP 工具、模型自我训练、无人值守云端部署。本版仍是同机 stdio 客户端共享服务；Graph 和可选模型的 HTTP 请求不等于对团队开放 HTTP MCP。没有真实团队资料，也没有公司 PPT 模板。
+
+## 完整 Skill ZIP
+
+在已安装固定依赖的开发环境执行 `python scripts/build-skill.py --output <新的ZIP路径>`。包内包含 SKILL.md、中文引导、Python 核心/工具、解析依赖及完整性清单；不含账号凭证、原始资料、索引或解释器。安装后说“初始化 DF 资料助手”。具体见 [0.6 说明](docs/UPGRADE_0_6.md)。
+
+纯云端运行仍需要批准的本地执行连接或独立资料服务；此 ZIP 不会部署远程服务或自动连接公司电脑。程序确认资料/索引范围后才建索引；公司 OAuth 应用由 IT 配置，员工本人登录。
 
 ## 安装：选择来源
 
