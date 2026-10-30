@@ -1,5 +1,41 @@
 # 验证记录
 
+## 0.6.0 / 2026-10-30：两选项 Skill ZIP、网络公盘与云盘目录选择
+
+新增 A 团队公盘/云盘、B 本地磁盘初始化，显式 plan/apply 与持久源身份绑定；完整 ZIP 携带 Python 核心与固定解析依赖，无需 Node 使用 CLI。新增 windows_share 只读适配和 Windows 本机 IPC 同用户检查，补充 SharePoint/OneDrive 有界目录发现、直接文件夹链接解析及不依赖 drive/folder 的显式登录入口。
+
+本地 macOS、Python 3.9.6、Node.js 26.9：修复后执行的 353 个 Python 测试中 338 通过、15 个平台/显式SMB开关测试跳过；安装器36、doctor8、云配置17（123组JS/Python配置一致性）、backend3通过。TypeScript构建、Skill官方格式检查、119个源码文件公开内容扫描及whitespace检查通过。合成固定评测14/14通过，不评估LLM回答准确率。
+
+ZIP端到端测试禁用系统site-packages，验证随包依赖、确认前不建状态、独立数据目录、分页、同broker索引复用及退出清理。独立Skill行为验收从完整包处理两份SIMULATED预算资料，跨分页读证据、排除draft并用Decimal正确合计120万元，原资料和配置未变。来源目录在确认前或首次索引前被替换会拒绝；这不等于原始文件版本从此不会变化，读取时仍核验。
+
+原13工具SDK→stdio→broker→解析/存储的本地与模拟Graph集成、六客户端并发和恢复、安装升级及索引复用通过。Graph测试禁止真实微软请求。Windows CI显式启用唯一localhost只读SMB临时fixture，结束删除该fixture；不连接公司共享盘、不启用服务或修改防火墙。该提交的跨平台结果以GitHub Actions为准。
+
+Windows CI 发现并修复了 UNC 共享根尾部斜杠比较、首次授权锁初始化写入竞争，以及网络源长期目录句柄妨碍普通原子保存的问题。网络源改为操作期间持有目录保护，结束后复核目录身份与变更；原生 SMB 测试在连接仍开启时用普通文件替换验证版本失效，另有空目录替换、目录新增与撤权回归。最终 Windows 结果以修复提交对应的 Actions 为准。
+
+未在公司DFS、VPN、微软租户或公司ChatGPT Skills上传入口验收。特殊DFS/reparse布局可能需要IT提供获批直接共享路径。Windows自定义目录DACL仍由公司策略管理。完整包不附Python解释器，不部署HTTP MCP/隧道/多用户服务器，不启用OCR。
+
+## 0.5.0 / 2026-10-29：OneDrive / SharePoint 来源
+
+新增 Microsoft Graph 单文件夹来源、显式设备码登录与静默刷新、按需下载解析、云端原始链接及版本引用。本地来源和 13 个 MCP 工具保持兼容。检索候选及可选模型输入前核验云端访问和 etag；证据读取另行下载并校验内容。部分枚举、断网、撤权和限流不能作为空目录或成功的离线证据。
+
+本地 macOS、Node.js 26.9.0、Python 3.9.6：Python 263 项中 256 项通过、7 项 Windows 专项跳过。新增 56 项覆盖 Graph 来源、OAuth/缓存和真实 Engine/解析/存储。安装器 36/36、doctor 8/8、云配置 17/17（含 123 组 JS/Python 一致性场景）、Backend 3/3；TypeScript 构建、Skill 官方格式校验通过。`npm run evaluate -- --output .local/evaluation-v05.json` 的合成评测 14/14 通过，不代表 LLM 回答准确率。
+
+`npm run test:cloud` 通过真实 SDK stdio → bridge → broker → Engine → parser/storage 链路验证 13 工具、来源与版本、导出和证据包、403 缓存拒绝、503 不误删、缺少授权及空 anchor。测试注入合成 Graph 响应并禁止真实 HTTP，不访问 Microsoft 租户。原本地 MCP、六客户端并发/崩溃恢复、完整安装与索引重用均通过。
+
+GitHub CI 已配置 Windows/macOS/Linux 与 Python 3.9/3.13，增加云配置和云 MCP 测试；具体提交的执行结果以 Actions 为准。尚未在真实租户验证企业同意、条件访问、设备码策略或网络出口；公司 OneDrive/SharePoint 的实际接入须按[云盘验收步骤](CLOUD_DRIVE.md)完成。当前仍是单个本机用户的 stdio 服务，不提供团队 HTTP 服务或多用户身份隔离；不新增 SMB/UNC、OCR 或云文件写入。
+
+跨平台 CI 追加修复：Graph 的七位小数时间在 Python 3.9 保留纳秒精度；OAuth/Graph/模型响应采用统一 JSON 深度上限；Windows 评测路径使用 POSIX 相对路径；Windows 索引元数据改用创建时间，避免 [CPython stat/fstat ctime 差异](https://github.com/python/cpython/issues/157671)导致无变化时反复索引，实际内容读取的校验保持。并发首次登录对 macOS 瞬时 ENOENT 仅作有界重验重试，链接与权限错误仍拒绝；云任务测试等待实际终态，模型批次预算测试使用确定时钟，避免依赖 CI 主机调度速度。
+
+## 0.4.0 / 2026-10-29：证据上下文、检索与可重复评测
+
+本次在 macOS、Node.js 26.9.0、Python 3.9.6 验证：Python 206 项中 199 项通过、7 项 Windows 专项跳过；安装器 36/36、doctor 8/8（含 91 组 Python/JS 配置一致性场景）、Backend 3/3 通过。TypeScript 构建、Skill 官方格式校验、源码公开内容扫描与 diff whitespace 检查通过。本轮没有推送或执行远程 CI；Windows/Linux 效果仍需对应运行环境验证。
+
+真实 stdio SDK 集成验证 13 个工具；六个并发客户端共享一份索引，容量释放、重连、bridge/broker 崩溃恢复及源文件保持不变均通过。完整安装测试在临时用户目录验证配置复用、Skill 替换备份、中文路径、实际启动命令与持久索引重用。测试不等于 Codex GUI 整机重启验收。
+
+新增 localhost 模拟模型测试覆盖实际 HTTP embedding 与 rerank 接口、无关键词重合的语义召回、版本与删除失效、候选过滤、分页快照、超时和异常响应降级、诊断不含正文。未连接真实 embedding/rerank 模型，不能由这些测试推断模型准确率或生产性能。
+
+`npm run evaluate` 的合成语料评测 14/14 通过；其中 5 个检索任务的 Recall@5 与 MRR 均为 1.0。题集很小且由项目生成，只验证检索与取证工具链，不生成或评分 LLM 答案，不能视为团队业务回答准确率。OCR 调查没有取得稳定输出，详见[调查记录](OCR_FEASIBILITY.md)。
+
 ## 0.3.0 / 2026-10-26：共享索引、持久恢复与证据覆盖
 
 面向公开安装的追加回归：安装器输出绝对 Node 与专用 Python 路径，避免桌面 PATH 或继承环境变量选错解释器；配置复用/doctor 共用离线选项检查，缺失解释器明确失败。真实 `test:install` 用临时用户环境验证默认外部状态、中文/空格路径、已有profile原样复用、Skill显式升级备份、向导实际命令启动双客户端、关闭重开复用及源只读。CI清洁安装矩阵覆盖三平台与 Python 3.9/3.13；该流程补上从“安装配置”到“实际使用”的回归链，不能替代任意企业机器的ACL/安全软件或Codex GUI验收。当前安装器36项、doctor7项；最新执行结果以工作流为准。

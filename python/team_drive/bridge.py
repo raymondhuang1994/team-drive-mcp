@@ -53,7 +53,7 @@ class Bridge:
         last_spawn = None
         started = time.time()
         try:
-            source = SourceAccess(self.config["root"])
+            source = SourceAccess(self.config["root"], allow_network=self.config.get("config", {}).get("provider", "local") == "windows_share")
             installation = Path(__file__).resolve().parents[2]
             base = validate_state_boundaries(self.config["base"], source, installation)
             storage = StateAccess(base / "shared-v1" / "control", source, installation)

@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import json
+import ntpath
 import os
 import re
 import stat
@@ -69,6 +70,25 @@ def relative_parts(relative):
 def _windows_component(part):
     if not part or any(c in part for c in '<>:"|?*') or part[-1:] in (".", " ") or any(ord(c) < 32 for c in part) or re.match(r"^(CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(?:\.|$)", part, re.I):
         raise DriveError("INVALID_PATH", "Device names, alternate streams, and ambiguous Windows paths are forbidden.")
+
+
+def canonical_windows_path(path):
+    """Pure Windows spelling normalization, including UNC share-root anchors.
+
+    Win32 can return a share root without its trailing slash; pathlib adds it.
+    ntpath.normpath alone preserves that difference. Subdirectory and different
+    share names remain distinct, and this never resolves or follows a path.
+    """
+    value = str(path)
+    if value.upper().startswith("\\\\?\\UNC\\"):
+        value = "\\\\" + value[8:]
+    elif value.startswith("\\\\?\\"):
+        value = value[4:]
+    value = ntpath.normcase(ntpath.normpath(value))
+    drive, tail = ntpath.splitdrive(value)
+    if drive.startswith("\\\\") and tail in ("", "\\"):
+        return drive + "\\"
+    return value
 
 
 def _identity(path):
@@ -307,6 +327,15 @@ if os.name == "nt":
     class _AttributeTagInfo(ctypes.Structure):
         _fields_ = [("attributes", wintypes.DWORD), ("tag", wintypes.DWORD)]
 
+    class _RemoteProtocolInfo(ctypes.Structure):
+        # FILE_REMOTE_PROTOCOL_INFO, Win8+ layout: the protocol-specific
+        # union's reserved member contains 16 ULONGs, with DWORD alignment.
+        _fields_ = [("version", wintypes.WORD), ("size", wintypes.WORD),
+                    ("protocol", wintypes.DWORD), ("major", wintypes.WORD),
+                    ("minor", wintypes.WORD), ("revision", wintypes.WORD),
+                    ("reserved", wintypes.WORD), ("flags", wintypes.DWORD),
+                    ("generic", wintypes.DWORD * 8), ("specific", wintypes.DWORD * 16)]
+
     _kernel.GetFileInformationByHandleEx.argtypes = [wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD]
     _kernel.GetFileInformationByHandleEx.restype = wintypes.BOOL
     _kernel.ReadFile.argtypes = [wintypes.HANDLE, ctypes.c_void_p, wintypes.DWORD, ctypes.POINTER(wintypes.DWORD), ctypes.c_void_p]
@@ -334,13 +363,11 @@ if os.name == "nt":
     _ntdll.RtlNtStatusToDosError.restype = wintypes.ULONG
 
     def _extended(path):
-        return "\\\\?\\" + str(path)
+        value = str(path)
+        return "\\\\?\\UNC\\" + value[2:] if value.startswith("\\\\") else "\\\\?\\" + value
 
     def _canonical(path):
-        value = str(path)
-        if value.startswith("\\\\?\\"):
-            value = value[4:]
-        return os.path.normcase(os.path.normpath(value))
+        return canonical_windows_path(path)
 
     def _file_info(handle):
         result = _FileInfo()
@@ -381,7 +408,45 @@ if os.name == "nt":
         if not copied or copied >= len(buffer):
             raise OSError("Cannot expand the approved directory name.")
         value = buffer.value
+        if value.upper().startswith("\\\\?\\UNC\\"):
+            return "\\\\" + value[8:]
         return value[4:] if value.startswith("\\\\?\\") else value
+
+    def _share_info(handle):
+        """Require a live SMB handle, usable identity and native change time.
+
+        Unknown remote providers and Windows Offline Files are not evidence.
+        Use the documented Win8+ caller version and exact structure size.
+        """
+        protocol = _RemoteProtocolInfo()
+        protocol.version = 2
+        protocol.size = ctypes.sizeof(protocol)
+        if not _kernel.GetFileInformationByHandleEx(handle, 13, ctypes.byref(protocol), ctypes.sizeof(protocol)):
+            raise DriveError("SHARE_PROTOCOL_UNVERIFIED", "The server did not provide verifiable SMB handle information.")
+        if (not 1 <= protocol.version <= 4 or not 20 <= protocol.size <= ctypes.sizeof(protocol) or
+                protocol.protocol != 0x00020000 or protocol.flags & 0x2):
+            raise DriveError("SHARE_PROTOCOL_UNVERIFIED", "Only online SMB files are supported; offline caches and other remote providers are excluded.")
+        info = _file_info(handle)
+        class FileIdInfo(ctypes.Structure):
+            _fields_ = [("volume", ctypes.c_ulonglong), ("identifier", ctypes.c_ubyte * 16)]
+        identity = FileIdInfo()
+        if not _kernel.GetFileInformationByHandleEx(handle, 18, ctypes.byref(identity), ctypes.sizeof(identity)):
+            raise DriveError("SHARE_IDENTITY_UNVERIFIED", "The server did not provide a stable full file identity.")
+        info.st_dev = identity.volume
+        info.st_ino = int.from_bytes(bytes(identity.identifier), "little")
+        if not info.st_ino or not info.st_dev or online_only(info):
+            raise DriveError("SHARE_IDENTITY_UNVERIFIED", "The remote object identity is unavailable or the object is offline.")
+        class BasicInfo(ctypes.Structure):
+            _fields_ = [("creation", ctypes.c_longlong), ("access", ctypes.c_longlong),
+                        ("write", ctypes.c_longlong), ("change", ctypes.c_longlong),
+                        ("attributes", wintypes.DWORD)]
+        basic = BasicInfo()
+        if not _kernel.GetFileInformationByHandleEx(handle, 0, ctypes.byref(basic), ctypes.sizeof(basic)):
+            raise DriveError("SHARE_IDENTITY_UNVERIFIED", "The remote change timestamp cannot be verified.")
+        info.st_birthtime_ns = info.st_ctime_ns
+        info.st_ctime_ns = (basic.change - 116444736000000000) * 100
+        info.st_network_change_ns = info.st_ctime_ns
+        return info
 
     def _handle(path, directory=False, write=False, create=False, exclusive=False, metadata_read=False, rename=False):
         access = _READ | (_WRITE if write else 0) | (_DELETE if rename else 0)
@@ -436,7 +501,10 @@ if os.name == "nt":
         # Cloud tags have provider-specific bits in positions 12 through 15.
         return online_only(info) or bool(info.st_file_attributes & _REPARSE and getattr(info, "st_reparse_tag", 0) & 0xFFFF0FFF == 0x9000001A)
 
-    def _valid_windows_path(raw):
+    def _valid_windows_path(raw, allow_network=False):
+        if allow_network:
+            from .network_source import resolve_share_path
+            return Path(resolve_share_path(str(raw)))
         value = os.path.abspath(os.path.expanduser(str(raw)))
         if not re.match(r"^[A-Za-z]:\\", value) or str(raw).startswith(("\\\\", "\\?", "\\.")):
             raise DriveError("UNSUPPORTED_ROOT_LOCATION", "Use an ordinary folder on a fixed local Windows drive; network and device paths are unsupported.")
@@ -448,12 +516,16 @@ if os.name == "nt":
         return path
 
     class _WindowsDirectories:
-        def __init__(self, path, create=False, code="UNSAFE_ROOT", state=False):
-            self.path = _valid_windows_path(path)
+        def __init__(self, path, create=False, code="UNSAFE_ROOT", state=False, allow_network=False, boundary=None):
+            if allow_network and (create or state):
+                raise DriveError("UNSAFE_STATE", "Network source access never permits state creation.")
+            self.network = allow_network
+            self.path = _valid_windows_path(path, allow_network=allow_network)
             if state:
                 validate_state_location(self.path)
             self.handles = []
             self.identities = []
+            self.targets = []
             self.code = code
             try:
                 current = Path(self.path.anchor)
@@ -467,19 +539,28 @@ if os.name == "nt":
                                 pass
                     handle = _handle(current, directory=True)
                     self.handles.append(handle)
-                    info = _file_info(handle)
+                    info = _share_info(handle) if self.network else _file_info(handle)
                     if not stat.S_ISDIR(info.st_mode) or info.st_file_attributes & _REPARSE:
                         raise DriveError(code, "Directory links, junctions, and reparse points are forbidden.")
                     # TEMP commonly contains a normal 8.3 account-directory
                     # alias. Expand it only once its no-reparse identity is pinned.
                     current = Path(_long_path(current))
-                    if _final_path(handle) != _canonical(current):
+                    target = _final_path(handle)
+                    if not self.network and target != _canonical(current):
                         raise DriveError(code, "The opened directory resolves to an unexpected location.")
+                    if self.network and boundary is not None:
+                        base, expected_target, expected_identity = boundary
+                        if current == base or base in current.parents:
+                            expected = _canonical(Path(expected_target) / current.relative_to(base))
+                            if (target != expected or info.st_dev != expected_identity[0] or
+                                    (current == base and (info.st_dev, info.st_ino) != expected_identity)):
+                                raise DriveError("SHARE_ROOT_CHANGED", "The shared folder target changed or a nested referral escaped its approved target.")
                     if state:
                         # Recheck canonical components while pinned, before any
                         # child is created, to close alias/rebinding races.
                         validate_state_location(current)
                     self.identities.append((current, info.st_dev, info.st_ino))
+                    self.targets.append(target)
                 self.path = current
             except Exception as exc:
                 self.close()
@@ -490,10 +571,20 @@ if os.name == "nt":
         def check(self):
             if not self.handles:
                 raise DriveError(self.code, "The guarded directory is no longer open.")
-            for handle, (path, device, inode) in zip(self.handles, self.identities):
-                info = _file_info(handle)
-                if (info.st_dev, info.st_ino) != (device, inode) or info.st_file_attributes & _REPARSE or _final_path(handle) != _canonical(path):
+            for handle, (path, device, inode), target in zip(self.handles, self.identities, self.targets):
+                info = _share_info(handle) if self.network else _file_info(handle)
+                if (info.st_dev, info.st_ino) != (device, inode) or info.st_file_attributes & _REPARSE or _final_path(handle) != target:
                     raise DriveError(self.code, "The guarded directory identity has changed.")
+                if self.network:
+                    # An old open handle can outlive an ACL change or DFS referral.
+                    # Freshly reopen every component under the current identity.
+                    fresh = _handle(path, directory=True)
+                    try:
+                        current = _share_info(fresh)
+                        if (current.st_dev, current.st_ino) != (device, inode) or current.st_file_attributes & _REPARSE or _final_path(fresh) != target:
+                            raise DriveError("SHARE_ROOT_CHANGED", "The shared folder identity or DFS target has changed.")
+                    finally:
+                        _kernel.CloseHandle(fresh)
 
         def close(self):
             for handle in reversed(self.handles):
@@ -501,27 +592,61 @@ if os.name == "nt":
             self.handles = []
 
     class WindowsSource:
-        def __init__(self, root):
-            self.guard = _WindowsDirectories(root)
+        def __init__(self, root, allow_network=False):
+            self.network = allow_network
+            self._closed = False
+            self.guard = _WindowsDirectories(root, allow_network=allow_network)
             self.root = self.guard.path
             self.identity = self.guard.identities[-1][1:]
+            self.target = self.guard.targets[-1]
+            self._root_chain = tuple(zip(self.guard.identities, self.guard.targets))
+            if self.network:
+                # Persist identities, not directory locks. A shared-folder
+                # broker must not block other users' atomic saves while idle.
+                self.guard.close()
+                self.guard = None
+
+        def _parent_guard(self, path):
+            if self._closed:
+                raise DriveError("SOURCE_UNAVAILABLE", "The source access session is closed.")
+            guard = _WindowsDirectories(path, code="SOURCE_UNAVAILABLE", allow_network=self.network,
+                                        boundary=(self.root, self.target, self.identity) if self.network else None)
+            if self.network:
+                observed = tuple(zip(guard.identities, guard.targets))
+                if observed[:len(self._root_chain)] != self._root_chain:
+                    guard.close()
+                    raise DriveError("SHARE_ROOT_CHANGED", "A shared-folder ancestor or approved root changed identity or target.")
+            return guard
+
+        def _expected_target(self, path):
+            return _canonical(Path(self.target) / path.relative_to(self.root)) if self.network else _canonical(path)
 
         def check_root(self):
+            if self._closed:
+                raise DriveError("SOURCE_UNAVAILABLE", "The source access session is closed.")
             try:
-                self.guard.check()
+                if self.network:
+                    current = self._parent_guard(self.root)
+                    current.close()
+                else:
+                    self.guard.check()
             except (DriveError, OSError):
+                if self.network:
+                    raise DriveError("SHARE_ROOT_UNAVAILABLE", "The shared folder is inaccessible, permissions changed, or its DFS target changed.", True,
+                                     "Restore the same approved target and Windows access; a new target requires a separate index.")
                 raise DriveError("SOURCE_ROOT_CHANGED", "The approved source directory identity changed.")
 
         def open_read(self, relative):
             self.check_root()
             parts = relative_parts(relative)
             path = self.root.joinpath(*parts)
-            guard = _WindowsDirectories(path.parent, code="SOURCE_UNAVAILABLE")
+            guard = self._parent_guard(path.parent)
             handle = None
+            fd = None
             try:
                 handle = _handle(path)
-                info = _file_info(handle)
-                if _final_path(handle) != _canonical(path) or _kernel.GetFileType(handle) != 1:
+                info = _share_info(handle) if self.network else _file_info(handle)
+                if _final_path(handle) != self._expected_target(path) or _kernel.GetFileType(handle) != 1:
                     raise DriveError("UNSAFE_FILE", "The source is redirected or is not a local disk file.")
                 if info.st_file_attributes & _REPARSE:
                     if _cloud(info):
@@ -533,19 +658,49 @@ if os.name == "nt":
                     raise DriveError("UNSAFE_FILE", "Only ordinary files with one hard link are supported.")
                 fd = msvcrt.open_osfhandle(handle, os.O_RDONLY | os.O_BINARY)
                 handle = None  # The C runtime now owns the handle.
-                return fd, os.fstat(fd)
+                result = (fd, self.stat_fd(fd))
+                fd = None
+                return result
             except OSError:
                 raise DriveError("SOURCE_UNAVAILABLE", "The source is missing, occupied, or inaccessible.", True, "Close applications with exclusive file locks and refresh.")
             finally:
                 if handle is not None:
                     _kernel.CloseHandle(handle)
+                if fd is not None:
+                    os.close(fd)
                 guard.close()
 
-        def walk(self, errors):
+        def stat_fd(self, fd):
+            return _share_info(msvcrt.get_osfhandle(fd)) if self.network else os.fstat(fd)
+
+        def observe(self, relative, parent_identity=None):
+            """Fresh no-follow metadata, including excluded files; no content read."""
+            self.check_root()
+            path = self.root.joinpath(*relative_parts(relative))
+            guard = self._parent_guard(path.parent)
+            handle = None
+            try:
+                if parent_identity is not None and guard.identities[-1][1:] != parent_identity:
+                    raise DriveError("SHARE_DIRECTORY_CHANGED", "A shared parent directory changed during enumeration.")
+                handle = _handle(path, directory=True)
+                info = _share_info(handle) if self.network else _file_info(handle)
+                target = _final_path(handle)
+                if target != self._expected_target(path) or _kernel.GetFileType(handle) != 1:
+                    raise DriveError("SHARE_ROOT_CHANGED", "The shared item resolves outside its approved target.")
+                return info
+            finally:
+                if handle is not None:
+                    _kernel.CloseHandle(handle)
+                guard.close()
+
+        def walk(self, errors, max_depth=None, max_items=None, deadline=None):
+            if self.network:
+                yield from self._walk_network(errors, max_depth=max_depth, max_items=max_items, deadline=deadline)
+                return
             self.check_root()
             def visit(folder, prefix):
                 try:
-                    guard = _WindowsDirectories(folder, code="SOURCE_UNAVAILABLE")
+                    guard = self._parent_guard(folder)
                 except DriveError:
                     errors.append(True)
                     return
@@ -575,8 +730,83 @@ if os.name == "nt":
                     guard.close()
             yield from visit(self.root, "")
 
+        def _walk_network(self, errors, max_depth=None, max_items=None, deadline=None):
+            """Pin only enumeration/observation windows; verify each directory.
+
+            No handle spans a yielded manifest item or a recursive visit. A
+            replacement parent or a changed directory listing aborts the scan,
+            which WindowsShareSource discards before publishing any inventory.
+            """
+            import time
+            count = 0
+
+            def budget():
+                if deadline is not None and time.monotonic() >= deadline:
+                    raise DriveError("SHARE_TIMEOUT", "The shared-folder scan exceeded its budget between Windows I/O calls.")
+
+            def signature(info):
+                return (info.st_dev, info.st_ino, info.st_mtime_ns, info.st_ctime_ns)
+
+            def visit(folder, prefix, expected_identity=None):
+                nonlocal count
+                budget()
+                if max_depth is not None and len(PurePosixPath(prefix).parts) > max_depth:
+                    raise DriveError("SHARE_SCAN_LIMIT", "The shared-folder scan exceeded its directory depth limit.")
+                guard = self._parent_guard(folder)
+                try:
+                    before = _share_info(guard.handles[-1])
+                    identity = (before.st_dev, before.st_ino)
+                    if expected_identity is not None and identity != expected_identity:
+                        raise DriveError("SHARE_DIRECTORY_CHANGED", "A shared directory was replaced before enumeration.")
+                    names = []
+                    with os.scandir(folder) as entries:
+                        for entry in entries:
+                            budget()
+                            count += 1
+                            if max_items is not None and count > max_items:
+                                raise DriveError("SHARE_SCAN_LIMIT", "The shared-folder scan exceeded its item limit.")
+                            names.append(entry.name)
+                finally:
+                    guard.close()
+                for name in names:
+                    budget()
+                    _windows_component(name)
+                    relative = (PurePosixPath(prefix) / name).as_posix()
+                    info = self.observe(relative, parent_identity=identity)
+                    reparse = bool(info.st_file_attributes & _REPARSE)
+                    online = online_only(info) or (reparse and getattr(info, "st_reparse_tag", 0) & 0xFFFF0FFF == 0x9000001A)
+                    if stat.S_ISDIR(info.st_mode) and not reparse and not online:
+                        yield from visit(folder / name, relative, (info.st_dev, info.st_ino))
+                    else:
+                        blocked = not online and (reparse or not stat.S_ISREG(info.st_mode) or info.st_nlink != 1)
+                        yield relative, info, blocked, online
+                budget()
+                guard = self._parent_guard(folder)
+                try:
+                    after = _share_info(guard.handles[-1])
+                    if signature(before) != signature(after):
+                        raise DriveError("SHARE_DIRECTORY_CHANGED", "A shared directory changed while its inventory was being collected.", True,
+                                         "Retry after directory updates finish; the previous inventory has not been replaced.")
+                finally:
+                    guard.close()
+
+            try:
+                self.check_root()
+                yield from visit(self.root, "")
+                self.check_root()
+            except (OSError, DriveError) as exc:
+                errors.append(True)
+                if isinstance(exc, DriveError):
+                    raise
+                code = getattr(exc, "winerror", None) or exc.errno
+                raise DriveError("SHARE_ENUMERATION_FAILED", "Shared metadata or directory enumeration failed (Windows error %s)." % code,
+                                 True, "Restore current Windows access before retrying; this is not an empty folder.") from None
+
         def close(self):
-            self.guard.close()
+            self._closed = True
+            if self.guard is not None:
+                self.guard.close()
+                self.guard = None
 
 
 class StateAccess:
@@ -589,6 +819,7 @@ class StateAccess:
         self.private_db_fd = None
         self.source_root = Path(source.root)
         self.source_identity = source.identity
+        self.network_source = getattr(source, "provider", None) == "windows_share"
         self.recovery = {"restored_snapshot": False, "discarded_working": False, "rebuilt_after_corruption": False}
         self.path = validate_state_boundaries(path, source, installation)
         if os.name == "nt":
@@ -609,7 +840,10 @@ class StateAccess:
     def check(self):
         try:
             validate_state_location(self.path)
-            if overlaps(self.path.resolve(), self.source_root.resolve()):
+            # A network source is pinned separately and cannot become state:
+            # state paths remain fixed-local and every ancestor stays guarded.
+            # Do not make private DB recovery depend on a live SMB connection.
+            if not self.network_source and overlaps(self.path.resolve(), self.source_root.resolve()):
                 raise DriveError("UNSAFE_STATE", "State storage has moved into the approved source boundary.")
             if self.guard:
                 self.guard.check()
@@ -1222,7 +1456,11 @@ class StateAccess:
             self.fd = None
 
 
-SourceAccess = WindowsSource if os.name == "nt" else PosixSource
+def SourceAccess(root, *, allow_network=False):
+    if allow_network:
+        from .network_source import WindowsShareSource
+        return WindowsShareSource(root)
+    return WindowsSource(root) if os.name == "nt" else PosixSource(root)
 
 
 def main():

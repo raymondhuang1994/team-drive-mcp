@@ -1,6 +1,6 @@
 {
   "name": "team-drive-mcp",
-  "version": "0.3.0",
+  "version": "0.6.0",
   "description": "Local-first, evidence-aware team document reader with MCP tools and an agent skill",
   "private": true,
   "type": "module",
@@ -24,7 +24,13 @@
     "maintain:state": "node scripts/maintain-state.mjs",
     "check:public": "node scripts/check-public.mjs",
     "install:skill": "node scripts/install-skill.mjs",
-    "test:install": "node scripts/install-smoke.mjs"
+    "test:install": "node scripts/install-smoke.mjs",
+    "evaluate": "node scripts/evaluate.mjs",
+    "configure:cloud": "node scripts/configure-cloud.mjs",
+    "login:cloud": "node scripts/login-cloud.mjs",
+    "test:cloud-configure": "node --test --test-timeout=30000 tests/cloud-configure.test.mjs",
+    "test:cloud": "node scripts/mcp-cloud-smoke.mjs",
+    "build:skill": "python scripts/build-skill.py"
   },
   "dependencies": {
     "@modelcontextprotocol/server": "2.3.1",

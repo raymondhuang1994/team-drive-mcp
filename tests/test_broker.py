@@ -12,6 +12,22 @@ from team_drive.errors import DriveError
 
 
 class BrokerLifecycleTests(unittest.TestCase):
+    def test_other_windows_user_is_rejected_before_config_or_tools(self):
+        broker = Broker.__new__(Broker)
+        broker.token = "synthetic-credential"
+        broker.clients_lock = threading.Lock()
+        connection = mock.Mock()
+        broker.connections = {connection}
+        broker.engine = mock.Mock()
+        with mock.patch("team_drive.broker.os.name", "nt"), \
+             mock.patch("team_drive.broker.receive", return_value={"type": "hello", "token": broker.token}), \
+             mock.patch("team_drive.broker.send") as send, \
+             mock.patch("team_drive.windows_identity.require_same_user_pipe", side_effect=DriveError("SERVICE_IDENTITY_MISMATCH", "Different Windows user")):
+            broker.handle(connection)
+        self.assertEqual(send.call_args.args[1]["error"]["code"], "SERVICE_IDENTITY_MISMATCH")
+        broker.engine.call.assert_not_called()
+        connection.close.assert_called_once()
+
     def test_idle_shutdown_sets_stop_while_admission_is_locked(self):
         broker = Broker.__new__(Broker)
         broker.clients_lock = threading.Lock()

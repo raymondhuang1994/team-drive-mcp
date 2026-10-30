@@ -75,8 +75,8 @@ def maintain(config_path, apply=False, reset_index=False, prune_exports_days=Non
     """Preview by default. Lease control before index; never delete recursively."""
     config_file = Path(config_path).expanduser().resolve(strict=True)
     config = json.loads(config_file.read_text(encoding="utf-8"))
-    if not isinstance(config, dict) or config.get("provider", "local") != "local":
-        raise DriveError("INVALID_CONFIG", "Use a local source configuration.")
+    if not isinstance(config, dict) or config.get("provider", "local") not in ("local", "microsoft_graph", "windows_share"):
+        raise DriveError("INVALID_CONFIG", "Use an explicit local, Windows share or Microsoft Graph source configuration.")
     for key in ("root", "state_dir"):
         if not isinstance(config.get(key), str) or not config[key]:
             raise DriveError("INVALID_CONFIG", "root and state_dir must be nonempty paths.")
@@ -91,8 +91,15 @@ def maintain(config_path, apply=False, reset_index=False, prune_exports_days=Non
     validate_state_location(base)
     pool_settings(config)  # Validate config, but enumerate all historical slots.
     root = configured_path("root")
-    source_missing = not root.exists()
-    source = SimpleNamespace(root=root.resolve(), identity=None) if source_missing else SourceAccess(root)
+    network = config.get("provider") == "windows_share"
+    # An unavailable share is not an orphaned source. Refuse maintenance until
+    # access can be verified, rather than accepting a new remote identity.
+    if network:
+        source = SourceAccess(root, allow_network=True)
+        source_missing = False
+    else:
+        source_missing = not root.exists()
+        source = SimpleNamespace(root=root.resolve(), identity=None) if source_missing else SourceAccess(root)
     installation = Path(__file__).resolve().parents[2]
     results = []
     try:

@@ -45,11 +45,27 @@ jobs:
       - run: npm run setup -- --skip-config
         env:
           DF_MCP_PYTHON: ${{ steps.python.outputs.python-path }}
+      - name: Verify native Windows share before full regression
+        if: runner.os == 'Windows'
+        run: .\.venv\Scripts\python.exe -m unittest discover -s tests -p test_network_source.py -v
+        env:
+          PYTHONPATH: python
+          DF_MCP_TEST_SMB: '1'
+      - name: Verify Windows credential publication before full regression
+        if: runner.os == 'Windows'
+        run: .\.venv\Scripts\python.exe -m unittest discover -s tests -p test_graph_auth.py -v
+        env:
+          PYTHONPATH: python
       - run: npm run test:installer
       - run: npm run test:doctor
+      - run: npm run test:cloud-configure
       - run: npm run test:backend
       - run: npm test
+        env:
+          DF_MCP_TEST_SMB: ${{ runner.os == 'Windows' && '1' || '0' }}
+      - run: npm run evaluate -- --output .local/evaluation-ci.json
       - run: npm run test:mcp
+      - run: npm run test:cloud
       - run: node scripts/mcp-concurrency.mjs
       - run: npm run test:install
       - run: npm run check:public
