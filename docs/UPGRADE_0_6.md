@@ -18,6 +18,8 @@ python scripts/build-skill.py --output .build/df-mcp-0.6.0.zip
 
 构建器只复制允许的源码、资源及三个固定版本的纯 Python 依赖，同时保留第三方许可证；不扫描或打包用户状态。输出路径已存在时拒绝覆盖。
 
+公司 Hub 上传格式要求 ZIP 根目录直接包含且仅包含一个 SKILL.md；scripts/、runtime/、references/ 与它同级，不增加 df-mcp/ 外层。Hub 生成完整分发包后，同事在获准的本地电脑 GPT 中安装使用。手动解压应先新建专用安装目录。打包回归按这一布局校验清单，并在解压后的完整包中实际运行初始化和索引复用。
+
 ## 初始化和持久索引
 
 probe / classify / plan 是只读检查；apply 要求确认且重算计划、重新核验来源。只在确认后创建独立本地 profile。状态和源、程序目录不得互相包含，不能把数据库放在同步盘或网络盘。默认路径沿用平台私有应用数据目录，支持 --state-dir。

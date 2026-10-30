@@ -26,13 +26,16 @@ class PackagedSkillTests(unittest.TestCase):
             self.assertLess(built["file_count"], 450)
             with zipfile.ZipFile(archive_path) as archive:
                 names = archive.namelist()
-                self.assertEqual(sum(name.endswith("/SKILL.md") for name in names), 1)
+                self.assertEqual(names.count("SKILL.md"), 1, "Hub requires SKILL.md at the archive root")
+                self.assertEqual(sum(Path(name).name.casefold() == "skill.md" for name in names), 1)
+                self.assertFalse(any(name.startswith("df-mcp/") for name in names))
                 self.assertFalse(any(name.endswith((".sqlite", ".pyc", "auth.json")) for name in names))
-                manifest = json.loads(archive.read("df-mcp/PACKAGE_MANIFEST.json"))
+                manifest = json.loads(archive.read("PACKAGE_MANIFEST.json"))
+                self.assertEqual(manifest["archive_layout"], "root-skill")
                 for entry in manifest["files"]:
-                    self.assertEqual(hashlib.sha256(archive.read("df-mcp/" + entry["path"])).hexdigest(), entry["sha256"])
+                    self.assertEqual(hashlib.sha256(archive.read(entry["path"])).hexdigest(), entry["sha256"])
                 archive.extractall(base / "install")
-            skill = base / "install" / "df-mcp"
+            skill = base / "install"
             env = dict(os.environ, PYTHONPATH="", PYTHONUTF8="1", PYTHONIOENCODING="utf-8", PYTHONDONTWRITEBYTECODE="1")
             def run(script, *args):
                 response = subprocess.run([sys.executable, "-S", str(skill / "scripts" / script), *args],

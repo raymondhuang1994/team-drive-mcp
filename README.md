@@ -46,7 +46,7 @@
 
 ## 完整 Skill ZIP
 
-在已安装固定依赖的开发环境执行 `python scripts/build-skill.py --output <新的ZIP路径>`。包内包含 SKILL.md、中文引导、Python 核心/工具、解析依赖及完整性清单；不含账号凭证、原始资料、索引或解释器。安装后说“初始化 DF 资料助手”。具体见 [0.6 说明](docs/UPGRADE_0_6.md)。
+在已安装固定依赖的开发环境执行 `python scripts/build-skill.py --output <新的ZIP路径>`。ZIP 根目录直接放一个 SKILL.md，scripts/、runtime/ 等与它同级，符合公司 Hub 的上传要求；不额外套 df-mcp/ 文件夹。包内包含中文引导、Python 核心/工具、解析依赖及完整性清单；不含账号凭证、原始资料、索引或解释器。同事将完整包安装到本地电脑 GPT 后说“初始化 DF 资料助手”。具体见 [0.6 说明](docs/UPGRADE_0_6.md)。
 
 纯云端运行仍需要批准的本地执行连接或独立资料服务；此 ZIP 不会部署远程服务或自动连接公司电脑。程序确认资料/索引范围后才建索引；公司 OAuth 应用由 IT 配置，员工本人登录。
 

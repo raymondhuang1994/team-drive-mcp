@@ -56,7 +56,10 @@ def build(output):
         if not count:
             raise ValueError("No dependency files found for " + name)
         vendors.append({"name": name, "version": distribution.version, "files": count})
+    if "SKILL.md" not in files or sum(PurePosixPath(name).name.casefold() == "skill.md" for name in files) != 1:
+        raise ValueError("The package must contain exactly one root-level SKILL.md.")
     manifest = {"schema": "df-mcp-skill-package-v1", "version": version, "python_minimum": "3.9",
+                "archive_layout": "root-skill",
                 "includes_python_interpreter": False, "source_documents_included": False,
                 "credentials_included": False, "index_included": False, "dependencies": vendors,
                 "files": [{"path": name, "bytes": len(data), "sha256": hashlib.sha256(data).hexdigest()}
@@ -69,7 +72,9 @@ def build(output):
     # Exclusive creation prevents accidentally replacing a reviewed release.
     with output.open("xb") as stream, zipfile.ZipFile(stream, "w", compression=zipfile.ZIP_DEFLATED) as archive:
         for name, data in sorted(files.items()):
-            member = zipfile.ZipInfo("df-mcp/" + name, date_time=(2026, 1, 1, 0, 0, 0))
+            # The company Hub reads SKILL.md at the archive root and creates
+            # the installation directory itself; do not wrap it in df-mcp/.
+            member = zipfile.ZipInfo(name, date_time=(2026, 1, 1, 0, 0, 0))
             member.compress_type = zipfile.ZIP_DEFLATED
             member.external_attr = 0o100644 << 16
             archive.writestr(member, data)
