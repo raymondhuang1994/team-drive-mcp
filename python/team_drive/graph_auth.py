@@ -397,8 +397,10 @@ class _CacheDirectory:
                 finally:
                     if handle is not None:
                         fs._kernel.CloseHandle(handle)
-                if info.st_size == 0:
-                    os.write(fd, b"0")
+                # _locking can lock beyond EOF, so an empty lock file needs no
+                # initialization write. Two first publishers may both observe
+                # size zero: writing here could hit a byte range already locked
+                # by the other handle and fail with a Windows sharing violation.
             else:
                 # macOS may return transient ENOENT when concurrent O_CREAT |
                 # O_NOFOLLOW calls first create this entry. Keep the directory

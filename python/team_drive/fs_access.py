@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import json
+import ntpath
 import os
 import re
 import stat
@@ -69,6 +70,25 @@ def relative_parts(relative):
 def _windows_component(part):
     if not part or any(c in part for c in '<>:"|?*') or part[-1:] in (".", " ") or any(ord(c) < 32 for c in part) or re.match(r"^(CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(?:\.|$)", part, re.I):
         raise DriveError("INVALID_PATH", "Device names, alternate streams, and ambiguous Windows paths are forbidden.")
+
+
+def canonical_windows_path(path):
+    """Pure Windows spelling normalization, including UNC share-root anchors.
+
+    Win32 can return a share root without its trailing slash; pathlib adds it.
+    ntpath.normpath alone preserves that difference. Subdirectory and different
+    share names remain distinct, and this never resolves or follows a path.
+    """
+    value = str(path)
+    if value.upper().startswith("\\\\?\\UNC\\"):
+        value = "\\\\" + value[8:]
+    elif value.startswith("\\\\?\\"):
+        value = value[4:]
+    value = ntpath.normcase(ntpath.normpath(value))
+    drive, tail = ntpath.splitdrive(value)
+    if drive.startswith("\\\\") and tail in ("", "\\"):
+        return drive + "\\"
+    return value
 
 
 def _identity(path):
@@ -347,12 +367,7 @@ if os.name == "nt":
         return "\\\\?\\UNC\\" + value[2:] if value.startswith("\\\\") else "\\\\?\\" + value
 
     def _canonical(path):
-        value = str(path)
-        if value.upper().startswith("\\\\?\\UNC\\"):
-            value = "\\\\" + value[8:]
-        elif value.startswith("\\\\?\\"):
-            value = value[4:]
-        return os.path.normcase(os.path.normpath(value))
+        return canonical_windows_path(path)
 
     def _file_info(handle):
         result = _FileInfo()
@@ -579,21 +594,42 @@ if os.name == "nt":
     class WindowsSource:
         def __init__(self, root, allow_network=False):
             self.network = allow_network
+            self._closed = False
             self.guard = _WindowsDirectories(root, allow_network=allow_network)
             self.root = self.guard.path
             self.identity = self.guard.identities[-1][1:]
             self.target = self.guard.targets[-1]
+            self._root_chain = tuple(zip(self.guard.identities, self.guard.targets))
+            if self.network:
+                # Persist identities, not directory locks. A shared-folder
+                # broker must not block other users' atomic saves while idle.
+                self.guard.close()
+                self.guard = None
 
         def _parent_guard(self, path):
-            return _WindowsDirectories(path, code="SOURCE_UNAVAILABLE", allow_network=self.network,
-                                       boundary=(self.root, self.target, self.identity) if self.network else None)
+            if self._closed:
+                raise DriveError("SOURCE_UNAVAILABLE", "The source access session is closed.")
+            guard = _WindowsDirectories(path, code="SOURCE_UNAVAILABLE", allow_network=self.network,
+                                        boundary=(self.root, self.target, self.identity) if self.network else None)
+            if self.network:
+                observed = tuple(zip(guard.identities, guard.targets))
+                if observed[:len(self._root_chain)] != self._root_chain:
+                    guard.close()
+                    raise DriveError("SHARE_ROOT_CHANGED", "A shared-folder ancestor or approved root changed identity or target.")
+            return guard
 
         def _expected_target(self, path):
             return _canonical(Path(self.target) / path.relative_to(self.root)) if self.network else _canonical(path)
 
         def check_root(self):
+            if self._closed:
+                raise DriveError("SOURCE_UNAVAILABLE", "The source access session is closed.")
             try:
-                self.guard.check()
+                if self.network:
+                    current = self._parent_guard(self.root)
+                    current.close()
+                else:
+                    self.guard.check()
             except (DriveError, OSError):
                 if self.network:
                     raise DriveError("SHARE_ROOT_UNAVAILABLE", "The shared folder is inaccessible, permissions changed, or its DFS target changed.", True,
@@ -637,13 +673,15 @@ if os.name == "nt":
         def stat_fd(self, fd):
             return _share_info(msvcrt.get_osfhandle(fd)) if self.network else os.fstat(fd)
 
-        def observe(self, relative):
+        def observe(self, relative, parent_identity=None):
             """Fresh no-follow metadata, including excluded files; no content read."""
             self.check_root()
             path = self.root.joinpath(*relative_parts(relative))
             guard = self._parent_guard(path.parent)
             handle = None
             try:
+                if parent_identity is not None and guard.identities[-1][1:] != parent_identity:
+                    raise DriveError("SHARE_DIRECTORY_CHANGED", "A shared parent directory changed during enumeration.")
                 handle = _handle(path, directory=True)
                 info = _share_info(handle) if self.network else _file_info(handle)
                 target = _final_path(handle)
@@ -656,16 +694,11 @@ if os.name == "nt":
                 guard.close()
 
         def walk(self, errors, max_depth=None, max_items=None, deadline=None):
+            if self.network:
+                yield from self._walk_network(errors, max_depth=max_depth, max_items=max_items, deadline=deadline)
+                return
             self.check_root()
-            count = 0
             def visit(folder, prefix):
-                nonlocal count
-                if deadline is not None:
-                    import time
-                    if time.monotonic() >= deadline:
-                        raise DriveError("SHARE_TIMEOUT", "The shared-folder scan exceeded its budget between Windows I/O calls.")
-                if max_depth is not None and len(PurePosixPath(prefix).parts) > max_depth:
-                    raise DriveError("SHARE_SCAN_LIMIT", "The shared-folder scan exceeded its directory depth limit.")
                 try:
                     guard = self._parent_guard(folder)
                 except DriveError:
@@ -674,24 +707,13 @@ if os.name == "nt":
                 try:
                     self.check_root()
                     with os.scandir(folder) as entries:
-                        names = []
-                        for entry in entries:
-                            if max_items is not None and count + len(names) >= max_items:
-                                raise DriveError("SHARE_SCAN_LIMIT", "The shared-folder scan exceeded its item limit.")
-                            if deadline is not None and time.monotonic() >= deadline:
-                                raise DriveError("SHARE_TIMEOUT", "The shared-folder scan exceeded its budget between Windows I/O calls.")
-                            names.append(entry.name)
+                        names = [entry.name for entry in entries]
                     for name in names:
-                        if deadline is not None and time.monotonic() >= deadline:
-                            raise DriveError("SHARE_TIMEOUT", "The shared-folder scan exceeded its budget between Windows I/O calls.")
-                        count += 1
-                        if max_items is not None and count > max_items:
-                            raise DriveError("SHARE_SCAN_LIMIT", "The shared-folder scan exceeded its item limit.")
                         try:
                             _windows_component(name)
                             path = folder / name
                             relative = (PurePosixPath(prefix) / name).as_posix()
-                            info = self.observe(relative) if self.network else os.stat(path, follow_symlinks=False)
+                            info = os.stat(path, follow_symlinks=False)
                             attributes = getattr(info, "st_file_attributes", 0)
                             reparse = bool(attributes & _REPARSE)
                             online = online_only(info) or (reparse and getattr(info, "st_reparse_tag", 0) & 0xFFFF0FFF == 0x9000001A)
@@ -708,8 +730,83 @@ if os.name == "nt":
                     guard.close()
             yield from visit(self.root, "")
 
+        def _walk_network(self, errors, max_depth=None, max_items=None, deadline=None):
+            """Pin only enumeration/observation windows; verify each directory.
+
+            No handle spans a yielded manifest item or a recursive visit. A
+            replacement parent or a changed directory listing aborts the scan,
+            which WindowsShareSource discards before publishing any inventory.
+            """
+            import time
+            count = 0
+
+            def budget():
+                if deadline is not None and time.monotonic() >= deadline:
+                    raise DriveError("SHARE_TIMEOUT", "The shared-folder scan exceeded its budget between Windows I/O calls.")
+
+            def signature(info):
+                return (info.st_dev, info.st_ino, info.st_mtime_ns, info.st_ctime_ns)
+
+            def visit(folder, prefix, expected_identity=None):
+                nonlocal count
+                budget()
+                if max_depth is not None and len(PurePosixPath(prefix).parts) > max_depth:
+                    raise DriveError("SHARE_SCAN_LIMIT", "The shared-folder scan exceeded its directory depth limit.")
+                guard = self._parent_guard(folder)
+                try:
+                    before = _share_info(guard.handles[-1])
+                    identity = (before.st_dev, before.st_ino)
+                    if expected_identity is not None and identity != expected_identity:
+                        raise DriveError("SHARE_DIRECTORY_CHANGED", "A shared directory was replaced before enumeration.")
+                    names = []
+                    with os.scandir(folder) as entries:
+                        for entry in entries:
+                            budget()
+                            count += 1
+                            if max_items is not None and count > max_items:
+                                raise DriveError("SHARE_SCAN_LIMIT", "The shared-folder scan exceeded its item limit.")
+                            names.append(entry.name)
+                finally:
+                    guard.close()
+                for name in names:
+                    budget()
+                    _windows_component(name)
+                    relative = (PurePosixPath(prefix) / name).as_posix()
+                    info = self.observe(relative, parent_identity=identity)
+                    reparse = bool(info.st_file_attributes & _REPARSE)
+                    online = online_only(info) or (reparse and getattr(info, "st_reparse_tag", 0) & 0xFFFF0FFF == 0x9000001A)
+                    if stat.S_ISDIR(info.st_mode) and not reparse and not online:
+                        yield from visit(folder / name, relative, (info.st_dev, info.st_ino))
+                    else:
+                        blocked = not online and (reparse or not stat.S_ISREG(info.st_mode) or info.st_nlink != 1)
+                        yield relative, info, blocked, online
+                budget()
+                guard = self._parent_guard(folder)
+                try:
+                    after = _share_info(guard.handles[-1])
+                    if signature(before) != signature(after):
+                        raise DriveError("SHARE_DIRECTORY_CHANGED", "A shared directory changed while its inventory was being collected.", True,
+                                         "Retry after directory updates finish; the previous inventory has not been replaced.")
+                finally:
+                    guard.close()
+
+            try:
+                self.check_root()
+                yield from visit(self.root, "")
+                self.check_root()
+            except (OSError, DriveError) as exc:
+                errors.append(True)
+                if isinstance(exc, DriveError):
+                    raise
+                code = getattr(exc, "winerror", None) or exc.errno
+                raise DriveError("SHARE_ENUMERATION_FAILED", "Shared metadata or directory enumeration failed (Windows error %s)." % code,
+                                 True, "Restore current Windows access before retrying; this is not an empty folder.") from None
+
         def close(self):
-            self.guard.close()
+            self._closed = True
+            if self.guard is not None:
+                self.guard.close()
+                self.guard = None
 
 
 class StateAccess:

@@ -4,11 +4,13 @@
 
 新增 A 团队公盘/云盘、B 本地磁盘初始化，显式 plan/apply 与持久源身份绑定；完整 ZIP 携带 Python 核心与固定解析依赖，无需 Node 使用 CLI。新增 windows_share 只读适配和 Windows 本机 IPC 同用户检查，补充 SharePoint/OneDrive 有界目录发现、直接文件夹链接解析及不依赖 drive/folder 的显式登录入口。
 
-本地 macOS、Python 3.9.6、Node.js 26.9：348 个 Python 测试中 336 通过、12 个平台/显式SMB开关测试跳过；安装器36、doctor8、云配置17（123组JS/Python配置一致性）、backend3通过。TypeScript构建、Skill官方格式检查、119个源码文件公开内容扫描及whitespace检查通过。合成固定评测14/14通过，不评估LLM回答准确率。
+本地 macOS、Python 3.9.6、Node.js 26.9：修复后执行的 353 个 Python 测试中 338 通过、15 个平台/显式SMB开关测试跳过；安装器36、doctor8、云配置17（123组JS/Python配置一致性）、backend3通过。TypeScript构建、Skill官方格式检查、119个源码文件公开内容扫描及whitespace检查通过。合成固定评测14/14通过，不评估LLM回答准确率。
 
 ZIP端到端测试禁用系统site-packages，验证随包依赖、确认前不建状态、独立数据目录、分页、同broker索引复用及退出清理。独立Skill行为验收从完整包处理两份SIMULATED预算资料，跨分页读证据、排除draft并用Decimal正确合计120万元，原资料和配置未变。来源目录在确认前或首次索引前被替换会拒绝；这不等于原始文件版本从此不会变化，读取时仍核验。
 
 原13工具SDK→stdio→broker→解析/存储的本地与模拟Graph集成、六客户端并发和恢复、安装升级及索引复用通过。Graph测试禁止真实微软请求。Windows CI显式启用唯一localhost只读SMB临时fixture，结束删除该fixture；不连接公司共享盘、不启用服务或修改防火墙。该提交的跨平台结果以GitHub Actions为准。
+
+Windows CI 发现并修复了 UNC 共享根尾部斜杠比较、首次授权锁初始化写入竞争，以及网络源长期目录句柄妨碍普通原子保存的问题。网络源改为操作期间持有目录保护，结束后复核目录身份与变更；原生 SMB 测试在连接仍开启时用普通文件替换验证版本失效，另有空目录替换、目录新增与撤权回归。最终 Windows 结果以修复提交对应的 Actions 为准。
 
 未在公司DFS、VPN、微软租户或公司ChatGPT Skills上传入口验收。特殊DFS/reparse布局可能需要IT提供获批直接共享路径。Windows自定义目录DACL仍由公司策略管理。完整包不附Python解释器，不部署HTTP MCP/隧道/多用户服务器，不启用OCR。
 

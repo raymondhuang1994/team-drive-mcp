@@ -19,6 +19,16 @@ from team_drive.service_config import settings
 
 
 class ShareSyntaxTests(unittest.TestCase):
+    def test_unc_anchor_trailing_slash_has_one_canonical_spelling(self):
+        from pathlib import PureWindowsPath
+        root = r"\\LOCALHOST\SyntheticShare"
+        expected = "\\\\localhost\\syntheticshare\\"
+        for value in (root, root + "\\", str(PureWindowsPath(root) / "."),
+                      r"\\?\UNC\LOCALHOST\SyntheticShare"):
+            self.assertEqual(fs_access.canonical_windows_path(value), expected)
+        self.assertNotEqual(fs_access.canonical_windows_path(root + r"\child"), expected)
+        self.assertNotEqual(fs_access.canonical_windows_path(root + "different"), expected)
+
     def test_explicit_unc_and_mapped_paths_only(self):
         self.assertEqual(normalize_share_path(r"\\server.example\approved\Finance"), r"\\server.example\approved\Finance")
         self.assertEqual(normalize_share_path("Z:\\Finance\\"), "Z:\\Finance")
@@ -88,6 +98,79 @@ class ShareSyntaxTests(unittest.TestCase):
         self.assertEqual(args[2], 1)
         self.assertEqual(args[4], 3)
         self.assertEqual(args[5], 0x00200000 | 0x02000000)
+
+    @unittest.skipUnless(os.name == "nt", "Native Windows scan error propagation")
+    def test_native_share_walk_preserves_specific_metadata_failure(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            (root / "synthetic.csv").write_text("SIMULATED", encoding="utf-8")
+            source = object.__new__(fs_access.WindowsSource)
+            source.root, source.network = root, True
+            errors = []
+            guard = SimpleNamespace(handles=[1], close=mock.Mock())
+            directory = SimpleNamespace(st_dev=1, st_ino=2, st_mtime_ns=3, st_ctime_ns=4)
+            with mock.patch.object(source, "check_root"), mock.patch.object(source, "_parent_guard", return_value=guard), \
+                    mock.patch.object(fs_access, "_share_info", return_value=directory), \
+                    mock.patch.object(source, "observe", side_effect=DriveError("SHARE_PROTOCOL_UNVERIFIED", "Synthetic protocol failure")):
+                with self.assertRaises(DriveError) as caught:
+                    list(source.walk(errors))
+            self.assertEqual(caught.exception.code, "SHARE_PROTOCOL_UNVERIFIED")
+            self.assertTrue(errors)
+
+    def _assert_empty_directory_interleaving_rejected(self, change):
+        # Real directory enumeration, with deterministic native metadata and
+        # changes injected exactly when the initial enumeration guard closes.
+        with tempfile.TemporaryDirectory() as temp:
+            base = Path(temp)
+            root = base / "approved"
+            root.mkdir()
+            source = object.__new__(fs_access.WindowsSource)
+            source.root, source.network, source._closed = root, True, False
+            opens, closes = [], []
+
+            def parent_guard(_folder):
+                number = len(opens) + 1
+                opens.append(number)
+                if number == 2 and change == "revocation":
+                    raise DriveError("SHARE_ACCESS_DENIED", "Synthetic current access revoked")
+
+                def close():
+                    closes.append(number)
+                    if number == 1:
+                        if change == "replacement":
+                            root.rename(base / "old-directory")
+                            root.mkdir()
+                        if change == "addition":
+                            (root / "new.csv").write_text("SIMULATED", encoding="utf-8")
+                return SimpleNamespace(handles=[number], close=close)
+
+            def info(handle):
+                return SimpleNamespace(st_dev=1, st_ino=3 if handle == 2 and change == "replacement" else 2,
+                                       st_mtime_ns=11 if handle == 2 and change == "addition" else 10,
+                                       st_ctime_ns=21 if handle == 2 and change == "addition" else 20)
+
+            errors = []
+            with mock.patch.object(source, "check_root"), mock.patch.object(source, "_parent_guard", side_effect=parent_guard), \
+                    mock.patch.object(fs_access, "_share_info", side_effect=info), mock.patch.object(source, "observe") as observe:
+                with self.assertRaises(DriveError) as caught:
+                    list(source.walk(errors))
+            expected = "SHARE_ACCESS_DENIED" if change == "revocation" else "SHARE_DIRECTORY_CHANGED"
+            self.assertEqual(caught.exception.code, expected)
+            self.assertTrue(errors)
+            self.assertEqual(closes, [1] if change == "revocation" else [1, 2])
+            observe.assert_not_called()
+
+    @unittest.skipUnless(os.name == "nt", "Native Windows short-lived directory guard")
+    def test_empty_directory_replacement_cannot_publish_complete_manifest(self):
+        self._assert_empty_directory_interleaving_rejected("replacement")
+
+    @unittest.skipUnless(os.name == "nt", "Native Windows short-lived directory guard")
+    def test_file_added_after_enumeration_cannot_publish_complete_manifest(self):
+        self._assert_empty_directory_interleaving_rejected("addition")
+
+    @unittest.skipUnless(os.name == "nt", "Native Windows short-lived directory guard")
+    def test_access_revoked_before_directory_recheck_cannot_publish_complete_manifest(self):
+        self._assert_empty_directory_interleaving_rejected("revocation")
 
 
 class SyntheticShareTests(unittest.TestCase):
@@ -174,6 +257,22 @@ class SyntheticShareTests(unittest.TestCase):
         self.engine.scan_once()
         return self.engine.search("travel")["files"][0]
 
+    @staticmethod
+    def replace_fixture(replacement, target):
+        if os.name != "nt":
+            os.replace(replacement, target)
+            return
+        # Production directory guards intentionally prohibit rebinding. Win32
+        # MoveFileEx also reopens the parent for writing, conflicting with that
+        # guard. This synthetic writer uses the existing same-directory native
+        # rename so the test still replaces file identity while guards stay held.
+        # It does not relax source handles or claim ordinary atomic saves work.
+        handle = fs_access._handle(replacement, rename=True)
+        try:
+            fs_access._rename_same_directory(handle, target.name)
+        finally:
+            fs_access._kernel.CloseHandle(handle)
+
     def test_digest_binds_content_identity_and_current_source(self):
         path = self.write()
         snapshot = io.BytesIO()
@@ -185,7 +284,7 @@ class SyntheticShareTests(unittest.TestCase):
         self.assertNotEqual(first, origin["content_sha256"])
         self.assertEqual(info.st_size, len(snapshot.getvalue()))
         replacement = self.write("replacement.csv")
-        os.replace(replacement, path)
+        self.replace_fixture(replacement, path)
         changed, _ = self.source.digest("budget.csv")
         self.assertNotEqual(first, changed, "A replaced object cannot reuse the old evidence version.")
 
@@ -303,7 +402,7 @@ class SyntheticShareTests(unittest.TestCase):
         path = self.write()
         file = self.build_engine()
         replacement = self.write("replacement.csv")
-        os.replace(replacement, path)
+        self.replace_fixture(replacement, path)
         stale = self.engine.call("read", {"file_id": file["file_id"], "expected_version": file["source_version"]})
         self.assertEqual(stale["error"]["code"], "STALE_SOURCE")
         self.engine.scan_once()
@@ -346,6 +445,9 @@ class NativeLocalhostSMBTests(unittest.TestCase):
                 config.write_text(json.dumps({"provider": "windows_share", "root": "\\\\localhost\\" + name,
                                               "state_dir": str(state)}), encoding="utf-8")
                 engine = Engine(str(config), autostart=False)
+                # Fail at the actual native stage before a generic inventory
+                # assertion can hide handle/path/protocol incompatibilities.
+                self.assertEqual(engine._source._native.observe("budget.csv").st_size, document.stat().st_size)
                 self.assertEqual(engine.scan_once()["job"]["status"], "complete")
                 file = engine.search("SIMULATED_TRAVEL")["files"][0]
                 read = engine.read(file["file_id"], expected_version=file["source_version"])
@@ -353,7 +455,11 @@ class NativeLocalhostSMBTests(unittest.TestCase):
                 self.assertEqual(read["origin"]["source_version"], read["source_version"])
                 self.assertEqual(engine.state, state)
                 self.assertEqual([child.name for child in source.iterdir()], ["budget.csv"])
-                document.write_text("category,amount\nSIMULATED_TRAVEL,999\n", encoding="utf-8")
+                replacement = source / "replacement.csv"
+                replacement.write_text("category,amount\nSIMULATED_TRAVEL,999\n", encoding="utf-8")
+                # The broker is still alive. An ordinary external atomic save
+                # must work between operations without special native helpers.
+                os.replace(replacement, document)
                 stale = engine.call("read", {"file_id": file["file_id"], "expected_version": file["source_version"]})
                 self.assertEqual(stale["error"]["code"], "STALE_SOURCE")
                 engine.scan_once()

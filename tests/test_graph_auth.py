@@ -7,9 +7,11 @@ import json
 import os
 from pathlib import Path
 import stat
+import sys
 import tempfile
 import threading
 import time
+from types import SimpleNamespace
 import unittest
 import urllib.parse
 from unittest import mock
@@ -244,6 +246,7 @@ class GraphAuthTests(unittest.TestCase):
     def test_concurrent_first_logins_cannot_publish_two_different_accounts(self):
         barrier = threading.Barrier(2)
         outcomes = []
+        diagnostics = []
 
         def request(tenant, action, fields, timeout):
             if action == "devicecode":
@@ -257,6 +260,7 @@ class GraphAuthTests(unittest.TestCase):
                 outcomes.append(("ok", result["account_id"]))
             except DriveError as exc:
                 outcomes.append((exc.code, None))
+                diagnostics.append((exc.code, exc.message))
 
         with mock.patch.object(auth, "_request", side_effect=request), mock.patch.object(auth, "_wait"):
             threads = [threading.Thread(target=login, name=name) for name in ("first", "second")]
@@ -265,9 +269,58 @@ class GraphAuthTests(unittest.TestCase):
             for thread in threads:
                 thread.join(timeout=5)
             self.assertFalse(any(thread.is_alive() for thread in threads))
-        self.assertEqual(sorted(item[0] for item in outcomes), ["AUTH_ACCOUNT_MISMATCH", "ok"])
+        self.assertEqual(sorted(item[0] for item in outcomes), ["AUTH_ACCOUNT_MISMATCH", "ok"], diagnostics)
         expected = next(binding for state, binding in outcomes if state == "ok")
         self.assertEqual(auth.TokenProvider(CONFIG, self.cache).account_binding, expected)
+
+    def test_windows_stale_empty_lock_metadata_does_not_write_into_competing_lock(self):
+        # Reproduce the Windows first-create ordering on every CI platform:
+        # this handle observed size=0, then another handle took byte 0. Windows
+        # rejects an initialization write, whereas lock contention must retry.
+        from pathlib import PureWindowsPath
+        from team_drive import fs_access as fs
+        directory = object.__new__(auth._CacheDirectory)
+        directory.path = PureWindowsPath(r"C:\synthetic-profile\auth.json")
+        directory.check = mock.Mock()
+        locking = mock.Mock(side_effect=[PermissionError(errno.EACCES, "synthetic competing lock"), None])
+        runtime = SimpleNamespace(open_osfhandle=mock.Mock(return_value=73), locking=locking, LK_NBLCK=2)
+        info = SimpleNamespace(st_mode=stat.S_IFREG | 0o600, st_nlink=1, st_file_attributes=0, st_size=0)
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(mock.patch.object(auth.os, "name", "nt"))
+            stack.enter_context(mock.patch.object(auth.os, "O_BINARY", 0, create=True))
+            stack.enter_context(mock.patch.object(auth.os, "lseek"))
+            closed = stack.enter_context(mock.patch.object(auth.os, "close"))
+            wrote = stack.enter_context(mock.patch.object(auth.os, "write", side_effect=PermissionError(errno.EACCES, "synthetic locked-byte write")))
+            stack.enter_context(mock.patch.object(auth.time, "sleep"))
+            stack.enter_context(mock.patch.object(fs, "_handle", return_value=91, create=True))
+            stack.enter_context(mock.patch.object(fs, "_file_info", return_value=info, create=True))
+            stack.enter_context(mock.patch.object(fs, "_REPARSE", 0x400, create=True))
+            stack.enter_context(mock.patch.object(fs, "_final_path", return_value="same-pinned-path", create=True))
+            stack.enter_context(mock.patch.object(fs, "_canonical", return_value="same-pinned-path", create=True))
+            stack.enter_context(mock.patch.object(fs, "msvcrt", runtime, create=True))
+            stack.enter_context(mock.patch.dict(sys.modules, {"msvcrt": runtime}))
+            with directory.publication_lock(1):
+                self.assertEqual(locking.call_count, 2)
+            wrote.assert_not_called()
+            closed.assert_called_once_with(73)
+        directory.check.assert_called()
+
+    @unittest.skipUnless(os.name == "nt", "Windows native byte-range lock contract")
+    def test_windows_empty_lock_excludes_another_handle_and_releases_on_close(self):
+        first = auth._CacheDirectory(self.cache, create=True)
+        second = auth._CacheDirectory(self.cache, create=True)
+        try:
+            with first.publication_lock(1):
+                self.assertEqual((self.cache.parent / ".auth.lock").stat().st_size, 0)
+                with self.assertRaises(DriveError) as error:
+                    with second.publication_lock(0.01):
+                        self.fail("A second handle cannot enter the locked publication region")
+                self.assertEqual(error.exception.code, "AUTH_CACHE_BUSY")
+            with second.publication_lock(1):
+                pass
+        finally:
+            first.close()
+            second.close()
 
     @unittest.skipIf(os.name == "nt", "POSIX O_CREAT/O_NOFOLLOW race; Windows uses guarded handles")
     def test_publication_lock_retries_only_transient_missing_entry(self):
