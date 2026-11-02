@@ -47,6 +47,84 @@ class ServiceConfigTests(unittest.TestCase):
                 self.write()
                 self.assertNotEqual(settings(self.path)["config_id"], original)
 
+    def test_retrieval_and_diagnostics_defaults_and_complete_local_configuration(self):
+        minimal = settings(self.path)["config"]
+        self.assertFalse(minimal["retrieval"]["semantic"]["enabled"])
+        self.assertFalse(minimal["retrieval"]["rerank"]["enabled"])
+        self.assertEqual(minimal["retrieval"]["semantic"]["per_file_budget_seconds"], 20)
+        self.assertEqual(minimal["diagnostics"], {"enabled": True, "max_events": 1000, "retention_days": 7})
+        self.config.update({
+            "retrieval": {"candidate_limit": 1000, "rrf_k": 1000,
+                "semantic": {"enabled": True, "endpoint": "http://localhost:11434/v1/embeddings",
+                    "model": "synthetic-embedding", "model_revision": "synthetic-revision",
+                    "timeout_seconds": 20, "batch_size": 64, "max_segments": 100000,
+                    "max_text_chars": 32000, "minimum_similarity": -1, "per_file_budget_seconds": 20},
+                "rerank": {"enabled": True, "endpoint": "https://192.168.1.2:8443/rerank",
+                    "model": "synthetic-rerank", "timeout_seconds": 0.1, "max_candidates": 100}},
+            "diagnostics": {"enabled": False, "max_events": 10000, "retention_days": 90}})
+        self.write()
+        with mock.patch("team_drive.retrieval._post", side_effect=AssertionError("Configuration cannot call models")):
+            configured = settings(self.path)["config"]
+        self.assertEqual(configured["retrieval"]["semantic"]["endpoint"], "http://127.0.0.1:11434/v1/embeddings")
+        self.assertEqual(configured["retrieval"]["rerank"]["model"], "synthetic-rerank")
+        self.assertEqual(configured["diagnostics"]["retention_days"], 90)
+        self.assertFalse((self.base / "state").exists())
+
+    def test_only_literal_local_model_endpoints_are_accepted(self):
+        allowed = ["http://127.0.0.1:11434/embed", "http://[::1]:1234/embed", "http://[0:0:0:0:0:0:0:1]/embed",
+                   "https://10.1.2.3/embed", "http://172.16.0.1/embed", "http://172.31.255.254/embed",
+                   "http://192.168.1.2/embed", "http://[fc00::1]/embed", "http://[fdff::1]/embed",
+                   "http://[fdff:ffff:ffff:ffff:ffff:ffff:ffff:ffff]/embed"]
+        for endpoint in allowed:
+            with self.subTest(endpoint=endpoint):
+                self.config = {"root": "source", "state_dir": "state", "retrieval": {
+                    "semantic": {"enabled": True, "endpoint": endpoint, "model": "synthetic"}}}
+                self.write()
+                self.assertEqual(settings(self.path)["config"]["retrieval"]["semantic"]["endpoint"], endpoint)
+                self.assertFalse((self.base / "state").exists())
+
+    def test_retrieval_and_diagnostics_invalid_options_reject_before_state_creation(self):
+        bad_endpoints = ["https://api.example.com/v1/embeddings", "http://8.8.8.8/embed",
+            "http://169.254.169.254/embed", "http://172.32.0.1/embed", "http://[fe80::1]/embed",
+            "http://model.internal/embed", "http://user:secret@127.0.0.1/embed",
+            "http://@127.0.0.1/embed", "http://127.0.0.1/embed?key=secret", "http://127.0.0.1/embed#fragment",
+            "http://127.0.0.1:0/embed", "http://127.0.0.1:65536/embed", "http://127.0.0.1:/embed", "http://[::1]:/embed",
+            "http://2130706433/embed", "http://127.1/embed", "http://0x7f000001/embed"]
+        cases = [{"retrieval": {kind: {"endpoint": endpoint}}}
+                 for endpoint in bad_endpoints for kind in ("semantic", "rerank")]
+        cases += [{"retrieval": None}, {"retrieval": []}, {"retrieval": {"enabled": True}},
+                  {"diagnostics": None}, {"diagnostics": []}, {"diagnostics": {"unknown": 1}}]
+        cases += [{"diagnostics": {key: value}} for key in ("max_events", "retention_days")
+                  for value in (-1, 0, True, 1.5)]
+        cases += [{"diagnostics": {"max_events": 10001}}, {"diagnostics": {"retention_days": 91}},
+                  {"diagnostics": {"enabled": "true"}}]
+        cases += [{"retrieval": {"semantic": {key: value}}} for key, value in (
+            ("enabled", "true"), ("enabled", True), ("timeout_seconds", 0.09), ("timeout_seconds", 20.01),
+            ("timeout_seconds", True), ("per_file_budget_seconds", 0), ("per_file_budget_seconds", 20.01),
+            ("per_file_budget_seconds", True), ("batch_size", 65), ("max_segments", 100001),
+            ("max_text_chars", 32001), ("minimum_similarity", -1.01), ("minimum_similarity", 1.01))]
+        cases += [{"retrieval": {"rerank": {key: value}}} for key, value in (
+            ("enabled", True), ("timeout_seconds", 0), ("timeout_seconds", 21),
+            ("max_candidates", 0), ("max_candidates", 101), ("model_revision", "not-supported"))]
+        cases += [{"retrieval": {key: value}} for key in ("candidate_limit", "rrf_k") for value in (0, 1001, True)]
+        for extra in cases:
+            with self.subTest(extra=extra):
+                self.config = dict(root="source", state_dir="state", **extra)
+                self.write()
+                with self.assertRaises(DriveError) as caught:
+                    settings(self.path)
+                self.assertEqual(caught.exception.code, "INVALID_CONFIG")
+                self.assertFalse((self.base / "state").exists())
+
+    def test_model_revision_and_diagnostics_change_binding(self):
+        original = settings(self.path)["config_id"]
+        for extra in ({"retrieval": {"semantic": {"model_revision": "synthetic-revision"}}},
+                      {"diagnostics": {"enabled": False}}, {"diagnostics": {"retention_days": 8}}):
+            with self.subTest(extra=extra):
+                self.config = dict(root="source", state_dir="state", **extra)
+                self.write()
+                self.assertNotEqual(settings(self.path)["config_id"], original)
+
     def test_code_binding_changes_only_when_selected_code_contents_change(self):
         code = self.base / "synthetic-code.py"
         code.write_text("VALUE = 1\n", encoding="utf-8")

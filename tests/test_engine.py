@@ -500,6 +500,17 @@ class EngineTests(unittest.TestCase):
             self.engine.close()
             self.assertEqual(checkpoint.call_count, 2)
 
+    def test_inventory_time_handles_windows_stat_fstat_creation_semantics(self):
+        from types import SimpleNamespace
+        by_path = SimpleNamespace(st_ctime_ns=10, st_birthtime_ns=10)
+        by_fd = SimpleNamespace(st_ctime_ns=20, st_birthtime_ns=10)
+        legacy_or_cloud = SimpleNamespace(st_ctime_ns=30)
+        with mock.patch("team_drive.engine.os.name", "nt"):
+            self.assertEqual(Engine._inventory_time(by_path), Engine._inventory_time(by_fd))
+            self.assertEqual(Engine._inventory_time(legacy_or_cloud), 30)
+        with mock.patch("team_drive.engine.os.name", "posix"):
+            self.assertEqual(Engine._inventory_time(by_fd), 20)
+
     def test_compact_cursors_bind_sessions_and_large_unicode_filters(self):
         binding = {"method": "search", "query": "预算" * 250, "prefix": "文" * 1024, "generation": 42}
         cursor = self.engine._cursor(binding, 17)

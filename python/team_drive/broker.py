@@ -79,7 +79,9 @@ class Broker:
         self.source = self.control = self.engine = self.listener = self.socket_guard = None
         self.elected = False
         try:
-            self.source = SourceAccess(self.config["root"])
+            self.source = (SourceAccess(self.config["root"], allow_network=True)
+                           if self.config["config"].get("provider") == "windows_share"
+                           else SourceAccess(self.config["root"]))
             install = Path(__file__).resolve().parents[2]
             base = validate_state_boundaries(self.config["base"], self.source, install)
             self.control = StateAccess(base / "shared-v1" / "control", self.source, install)
@@ -115,6 +117,13 @@ class Broker:
             if hello.get("type") != "hello" or not isinstance(hello.get("token"), str) or not hmac.compare_digest(hello["token"], self.token):
                 send(connection, failure("SERVICE_AUTH_FAILED", "The local service credential is invalid."))
                 return
+            if os.name == "nt":
+                from .windows_identity import require_same_user_pipe
+                try:
+                    require_same_user_pipe(connection.fileno())
+                except DriveError as exc:
+                    send(connection, failure(exc.code, exc.message, exc.retryable, exc.next_action))
+                    return
             if hello.get("config_id") != self.config["config_id"] or hello.get("code_id") != self.config["code_id"]:
                 send(connection, failure("SERVICE_CONFIGURATION_CONFLICT", "An older or differently configured service is still active.", False, "Close connections using the earlier configuration, wait for idle shutdown, then reconnect."))
                 return
