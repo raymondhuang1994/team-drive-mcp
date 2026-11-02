@@ -4,6 +4,7 @@
 
 给 AI 使用的团队文件读取工具，支持普通本地目录、显式配置的 Windows 网络公盘，以及 OneDrive/SharePoint 云盘文件夹。Skill 名称为 **`df-mcp`**，界面名称为 **df mcp**；GitHub 仓库仍使用 `team-drive-mcp`。架构：**Skill + Python 工具入口 / 本机 MCP + SQLite 增量索引**。优先保证来源、版本和读取范围可核查，再优化定位速度。所有附带业务数据均为 **SIMULATED / 完全虚构**。
 
+- [0.6.1 网络盘祖先目录权限修复与正式验收](docs/UPGRADE_0_6_1.md)
 - [0.6 完整 Skill ZIP、两选项初始化与网络公盘](docs/UPGRADE_0_6.md)
 - [给同事的安装说明](skills/df-mcp/INSTALL.md)
 - [0.5 OneDrive/SharePoint 配置、登录与验收](docs/CLOUD_DRIVE.md)

@@ -31,6 +31,8 @@ Before creating state or indexing, show the actual source/account, inclusion of 
 
 The source must stay explicit. No evidence query silently changes the configured folder, registers another MCP, installs an OS runtime or expands cloud authorization. A connected old release stays old until separately upgraded.
 
+For an explicitly requested Windows share upgrade acceptance or an ancestor-directory permission initialization failure, follow [Windows 网络盘正式验收](references/windows-share-acceptance.md). It verifies the installed runtime and the confirmed source through real inspect/read; it is not a setup checklist to repeat for ordinary queries.
+
 ## Evidence workflow
 
 - Distinguish lookup from exhaustive work. Totals, rankings, absence claims and cross-file comparisons require a defined and completely enumerated population. Search relevance is not completeness.

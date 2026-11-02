@@ -1,8 +1,10 @@
 """Read-only source boundary and guarded private state on POSIX and Windows.
 
-Windows handles use OPEN_EXISTING and GENERIC_READ for source files. Directory
-handles deny delete sharing so an approved directory chain cannot be rebound
-while the corresponding read or enumeration is in progress. Reparse points,
+Windows handles use OPEN_EXISTING and GENERIC_READ for source files. Only strict
+ancestors outside an approved network source use FILE_READ_ATTRIBUTES. Readable
+directory handles retain their no-delete sharing; attribute-only ancestors also
+undergo identity, actual-target and reparse checks when opened and reopened.
+Reparse points,
 remote/device paths, and multiply linked source files are deliberately excluded.
 """
 from __future__ import annotations
@@ -295,6 +297,7 @@ if os.name == "nt":
     _ntdll = ctypes.WinDLL("ntdll")
     _INVALID = ctypes.c_void_p(-1).value
     _READ = 0x80000000
+    _READ_ATTRIBUTES = 0x80
     _WRITE = 0x40000000
     _DELETE = 0x00010000
     _SHARE_READ_WRITE = 0x1 | 0x2  # Never FILE_SHARE_DELETE for pinned objects.
@@ -448,10 +451,15 @@ if os.name == "nt":
         info.st_network_change_ns = info.st_ctime_ns
         return info
 
-    def _handle(path, directory=False, write=False, create=False, exclusive=False, metadata_read=False, rename=False):
-        access = _READ | (_WRITE if write else 0) | (_DELETE if rename else 0)
-        # Pin directory metadata as well as its name: disallow write sharing so
-        # SetReparsePoint cannot redirect an already approved directory in place.
+    def _handle(path, directory=False, write=False, create=False, exclusive=False, metadata_read=False, rename=False,
+                attributes_only=False):
+        # This mode is selected only for strict network-source ancestors by
+        # _WindowsDirectories. It is not the private JSON sharing opt-in below.
+        if attributes_only and (not directory or write or create or exclusive or metadata_read or rename):
+            raise DriveError("INVALID_ACCESS_MODE", "Attribute-only access is limited to existing guarded directories.")
+        access = _READ_ATTRIBUTES if attributes_only else _READ | (_WRITE if write else 0) | (_DELETE if rename else 0)
+        # Preserve existing directory sharing flags. Attribute-only handles do
+        # not substitute for the guard's identity/target/reparse verification.
         sharing = 0 if exclusive else 0x1 if directory else _SHARE_READ_WRITE
         if metadata_read and not directory and not write and not create and not exclusive:
             # Atomic endpoint JSON publication may replace a file being read.
@@ -516,20 +524,32 @@ if os.name == "nt":
         return path
 
     class _WindowsDirectories:
-        def __init__(self, path, create=False, code="UNSAFE_ROOT", state=False, allow_network=False, boundary=None):
+        def __init__(self, path, create=False, code="UNSAFE_ROOT", state=False, allow_network=False, boundary=None,
+                     source_root=None):
             if allow_network and (create or state):
                 raise DriveError("UNSAFE_STATE", "Network source access never permits state creation.")
+            if source_root is not None and not allow_network:
+                raise DriveError(code, "An attribute-only ancestor boundary is valid only for a network source.")
             self.network = allow_network
             self.path = _valid_windows_path(path, allow_network=allow_network)
+            self.source_root = _valid_windows_path(source_root, allow_network=True) if source_root is not None else None
+            if self.source_root is not None:
+                # Windows Path comparisons use components and case-insensitive
+                # spelling; a similarly named sibling is not an ancestor.
+                if self.path != self.source_root and self.source_root not in self.path.parents:
+                    raise DriveError(code, "The guarded directory is outside the approved network source.")
+                if boundary is not None and _canonical(boundary[0]) != _canonical(self.source_root):
+                    raise DriveError(code, "The ancestor-access boundary must match the approved source boundary.")
             if state:
                 validate_state_location(self.path)
             self.handles = []
             self.identities = []
             self.targets = []
+            self.attribute_modes = []
             self.code = code
             try:
                 current = Path(self.path.anchor)
-                for part in (None,) + self.path.parts[1:]:
+                for depth, part in enumerate((None,) + self.path.parts[1:], start=1):
                     if part is not None:
                         current = current / part
                         if create:
@@ -537,8 +557,13 @@ if os.name == "nt":
                                 current.mkdir(mode=0o700)
                             except FileExistsError:
                                 pass
-                    handle = _handle(current, directory=True)
+                    # The component-prefix check above proves these positions
+                    # are strict ancestors. Keep the classification stable if
+                    # GetLongPathName expands an ordinary 8.3 component below.
+                    attributes_only = self.source_root is not None and depth < len(self.source_root.parts)
+                    handle = _handle(current, directory=True, attributes_only=attributes_only)
                     self.handles.append(handle)
+                    self.attribute_modes.append(attributes_only)
                     info = _share_info(handle) if self.network else _file_info(handle)
                     if not stat.S_ISDIR(info.st_mode) or info.st_file_attributes & _REPARSE:
                         raise DriveError(code, "Directory links, junctions, and reparse points are forbidden.")
@@ -571,14 +596,15 @@ if os.name == "nt":
         def check(self):
             if not self.handles:
                 raise DriveError(self.code, "The guarded directory is no longer open.")
-            for handle, (path, device, inode), target in zip(self.handles, self.identities, self.targets):
+            for handle, (path, device, inode), target, attributes_only in zip(
+                    self.handles, self.identities, self.targets, self.attribute_modes):
                 info = _share_info(handle) if self.network else _file_info(handle)
                 if (info.st_dev, info.st_ino) != (device, inode) or info.st_file_attributes & _REPARSE or _final_path(handle) != target:
                     raise DriveError(self.code, "The guarded directory identity has changed.")
                 if self.network:
                     # An old open handle can outlive an ACL change or DFS referral.
                     # Freshly reopen every component under the current identity.
-                    fresh = _handle(path, directory=True)
+                    fresh = _handle(path, directory=True, attributes_only=attributes_only)
                     try:
                         current = _share_info(fresh)
                         if (current.st_dev, current.st_ino) != (device, inode) or current.st_file_attributes & _REPARSE or _final_path(fresh) != target:
@@ -595,7 +621,8 @@ if os.name == "nt":
         def __init__(self, root, allow_network=False):
             self.network = allow_network
             self._closed = False
-            self.guard = _WindowsDirectories(root, allow_network=allow_network)
+            self.guard = _WindowsDirectories(root, allow_network=allow_network,
+                                             source_root=root if allow_network else None)
             self.root = self.guard.path
             self.identity = self.guard.identities[-1][1:]
             self.target = self.guard.targets[-1]
@@ -610,7 +637,8 @@ if os.name == "nt":
             if self._closed:
                 raise DriveError("SOURCE_UNAVAILABLE", "The source access session is closed.")
             guard = _WindowsDirectories(path, code="SOURCE_UNAVAILABLE", allow_network=self.network,
-                                        boundary=(self.root, self.target, self.identity) if self.network else None)
+                                        boundary=(self.root, self.target, self.identity) if self.network else None,
+                                        source_root=self.root if self.network else None)
             if self.network:
                 observed = tuple(zip(guard.identities, guard.targets))
                 if observed[:len(self._root_chain)] != self._root_chain:

@@ -1,8 +1,10 @@
 """SMB contracts use local synthetic fixtures; no company server is contacted."""
+import contextlib
 import hashlib
 import io
 import json
 import os
+import stat
 from pathlib import Path
 import tempfile
 import subprocess
@@ -171,6 +173,161 @@ class ShareSyntaxTests(unittest.TestCase):
     @unittest.skipUnless(os.name == "nt", "Native Windows short-lived directory guard")
     def test_access_revoked_before_directory_recheck_cannot_publish_complete_manifest(self):
         self._assert_empty_directory_interleaving_rejected("revocation")
+
+
+@unittest.skipUnless(os.name == "nt", "Windows desired-access and directory-chain contract")
+class AncestorAccessTests(unittest.TestCase):
+    @contextlib.contextmanager
+    def native_tree(self):
+        """Keep the real guard algorithms; replace only Windows API results."""
+        import ctypes
+        root = Path(r"\\synthetic-server\share\Department\Approved")
+        fixture = SimpleNamespace(root=root, calls=[], handles={}, closed=[], identities={},
+                                  denied=set(), reparse=set(), targets={}, changed=set())
+
+        def create(path, access, sharing, security, creation, flags, template):
+            path = fs_access.canonical_windows_path(path)
+            fixture.calls.append((path, access, sharing, creation, flags))
+            if (path, access) in fixture.denied:
+                ctypes.set_last_error(5)
+                return fs_access._INVALID
+            handle = len(fixture.handles) + 100
+            fixture.handles[handle] = path
+            fixture.identities.setdefault(path, len(fixture.identities) + 1)
+            return handle
+
+        def info(handle):
+            path = fixture.handles[handle]
+            return SimpleNamespace(st_mode=stat.S_IFREG if path.endswith(".csv") else stat.S_IFDIR,
+                st_dev=7, st_ino=fixture.identities[path] + (1000 if path in fixture.changed else 0),
+                st_size=10, st_mtime_ns=100, st_ctime_ns=100, st_nlink=1,
+                st_file_attributes=0x400 if path in fixture.reparse else 0, st_reparse_tag=0)
+
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(mock.patch.object(fs_access, "_valid_windows_path", side_effect=lambda value, **_kwargs: Path(value)))
+            stack.enter_context(mock.patch.object(fs_access, "_long_path", side_effect=str))
+            stack.enter_context(mock.patch.object(fs_access, "_share_info", side_effect=info))
+            stack.enter_context(mock.patch.object(fs_access, "_file_info", side_effect=info))
+            stack.enter_context(mock.patch.object(fs_access, "_final_path", side_effect=lambda handle:
+                fixture.targets.get(fixture.handles[handle], fixture.handles[handle])))
+            stack.enter_context(mock.patch.object(fs_access._kernel, "CreateFileW", side_effect=create))
+            stack.enter_context(mock.patch.object(fs_access._kernel, "CloseHandle", side_effect=fixture.closed.append))
+            stack.enter_context(mock.patch.object(fs_access._kernel, "GetFileType", return_value=1))
+            yield fixture
+        self.assertEqual(set(fixture.closed), set(fixture.handles), "Every successfully opened test handle must close")
+
+    def assert_source_modes(self, fixture):
+        ancestors = {fs_access.canonical_windows_path(path) for path in fixture.root.parents}
+        self.assertTrue(fixture.calls)
+        for path, access, sharing, creation, flags in fixture.calls:
+            self.assertEqual(access, 0x80 if path in ancestors else 0x80000000, path)
+            self.assertEqual(creation, 3)
+            self.assertFalse(sharing & 4, "Source handles must not gain delete sharing")
+
+    def test_attribute_handle_uses_only_0x80_without_changing_open_or_sharing_flags(self):
+        with mock.patch.object(fs_access._kernel, "CreateFileW", return_value=42) as create:
+            self.assertEqual(fs_access._handle(r"\\synthetic-server\share\Parent", directory=True, attributes_only=True), 42)
+        args = create.call_args.args
+        self.assertEqual(args[1], 0x80)
+        self.assertEqual(args[2], 1)
+        self.assertEqual(args[4], 3)
+        self.assertEqual(args[5], 0x00200000 | 0x02000000)
+        for forbidden in ({"directory": False}, {"write": True}, {"create": True}, {"rename": True}, {"metadata_read": True}, {"exclusive": True}):
+            options = dict(directory=True, attributes_only=True)
+            options.update(forbidden)
+            with self.subTest(options=options), mock.patch.object(fs_access._kernel, "CreateFileW") as create:
+                with self.assertRaises(DriveError):
+                    fs_access._handle(r"\\synthetic-server\share\Parent", **options)
+                create.assert_not_called()
+
+    def test_initial_parent_guard_check_and_root_reopen_keep_the_same_source_boundary(self):
+        with self.native_tree() as tree:
+            parent = fs_access.canonical_windows_path(tree.root.parent)
+            tree.denied.add((parent, 0x80000000))
+            source = fs_access.WindowsSource(tree.root, allow_network=True)
+            try:
+                source.check_root()
+                guard = source._parent_guard(tree.root / "nested")
+                try:
+                    guard.check()
+                finally:
+                    guard.close()
+            finally:
+                source.close()
+            self.assert_source_modes(tree)
+            self.assertGreater(sum(path == parent for path, *_ in tree.calls), 2)
+            self.assertIn((fs_access.canonical_windows_path(tree.root / "nested"), 0x80000000),
+                          [(path, access) for path, access, *_ in tree.calls])
+
+    def test_root_and_file_read_denials_never_fall_back_to_attributes(self):
+        with self.native_tree() as tree:
+            root = fs_access.canonical_windows_path(tree.root)
+            tree.denied.add((root, 0x80000000))
+            with self.assertRaises(DriveError):
+                fs_access.WindowsSource(tree.root, allow_network=True)
+            self.assertEqual([access for path, access, *_ in tree.calls if path == root], [0x80000000])
+        with self.native_tree() as tree:
+            source = fs_access.WindowsSource(tree.root, allow_network=True)
+            path = fs_access.canonical_windows_path(tree.root / "private.csv")
+            tree.denied.add((path, 0x80000000))
+            try:
+                with self.assertRaises(DriveError):
+                    source.open_read("private.csv")
+            finally:
+                source.close()
+            self.assertEqual([access for current, access, *_ in tree.calls if current == path], [0x80000000])
+
+    def test_ancestor_attribute_denial_is_rechecked_and_does_not_bypass_access(self):
+        with self.native_tree() as tree:
+            guard = fs_access._WindowsDirectories(tree.root, allow_network=True, source_root=tree.root)
+            parent = fs_access.canonical_windows_path(tree.root.parent)
+            tree.denied.add((parent, 0x80))
+            try:
+                with self.assertRaises((DriveError, OSError)):
+                    guard.check()
+            finally:
+                guard.close()
+            self.assert_source_modes(tree)
+        with self.native_tree() as tree:
+            tree.denied.add((fs_access.canonical_windows_path(tree.root.parent), 0x80))
+            with self.assertRaises(DriveError):
+                fs_access.WindowsSource(tree.root, allow_network=True)
+
+    def test_similar_prefix_sibling_cannot_borrow_an_approved_root(self):
+        with self.native_tree() as tree:
+            with self.assertRaises(DriveError):
+                fs_access._WindowsDirectories(tree.root.parent / "Approved-extra" / "nested",
+                    allow_network=True, source_root=tree.root)
+            self.assertFalse(tree.calls, "Reject a mismatched root before opening any ancestor")
+
+    def test_attribute_ancestors_still_reject_identity_target_and_reparse_changes(self):
+        for change in ("identity", "target", "reparse"):
+            with self.subTest(change=change), self.native_tree() as tree:
+                source = fs_access.WindowsSource(tree.root, allow_network=True)
+                parent = fs_access.canonical_windows_path(tree.root.parent)
+                if change == "identity":
+                    tree.changed.add(parent)
+                elif change == "target":
+                    tree.targets[parent] = r"\\other-server\unexpected\parent"
+                else:
+                    tree.reparse.add(parent)
+                try:
+                    with self.assertRaises(DriveError):
+                        source.check_root()
+                finally:
+                    source.close()
+                self.assert_source_modes(tree)
+
+    def test_local_directories_and_unscoped_network_guards_keep_generic_read(self):
+        for network, path in ((False, Path(r"C:\synthetic\local")), (True, Path(r"\\synthetic-server\share\unscoped"))):
+            with self.subTest(network=network), self.native_tree() as tree:
+                guard = fs_access._WindowsDirectories(path, allow_network=network)
+                try:
+                    guard.check()
+                finally:
+                    guard.close()
+                self.assertTrue(tree.calls)
+                self.assertEqual({access for _path, access, *_ in tree.calls}, {0x80000000})
 
 
 class SyntheticShareTests(unittest.TestCase):
@@ -414,16 +571,23 @@ class SyntheticShareTests(unittest.TestCase):
                      "Real localhost SMB test requires Windows and explicit DF_MCP_TEST_SMB=1")
 class NativeLocalhostSMBTests(unittest.TestCase):
     def test_current_user_readonly_share_and_local_index_roundtrip(self):
-        # Explicit opt-in only: create one unique, synthetic, localhost share.
-        # Do not enable services, change firewall rules, or use external servers.
+        # Explicit opt-in only: one unique synthetic localhost share. A deny ACE
+        # applies only to a temporary parent, never inherited by its readable
+        # child. No account, service, firewall or company share is changed.
+        from team_drive.onboarding import make_plan, apply_plan
         with tempfile.TemporaryDirectory(prefix="df-simulated-smb-") as temp:
             base = Path(temp).resolve()
-            source = base / "SIMULATED_SOURCE"
-            source.mkdir()
-            document = source / "budget.csv"
+            shared = base / "SIMULATED_SHARE"
+            restricted = shared / "Restricted Parent"
+            source = restricted / "Approved Data"
+            nested = source / "nested"
+            nested.mkdir(parents=True)
+            document = nested / "budget.csv"
             document.write_text("category,amount\nSIMULATED_TRAVEL,120\n", encoding="utf-8")
             name = "df_simulated_" + uuid.uuid4().hex
-            env = dict(os.environ, DF_MCP_TEST_SHARE_NAME=name, DF_MCP_TEST_SHARE_PATH=str(source))
+            backup = base / "synthetic-parent-acl.txt"
+            env = dict(os.environ, DF_MCP_TEST_SHARE_NAME=name, DF_MCP_TEST_SHARE_PATH=str(shared),
+                       DF_MCP_TEST_RESTRICTED_PARENT=str(restricted), DF_MCP_TEST_ACL_BACKUP=str(backup))
 
             def powershell(command):
                 return subprocess.run(["powershell.exe", "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", command],
@@ -432,30 +596,67 @@ class NativeLocalhostSMBTests(unittest.TestCase):
             engine = None
             try:
                 setup = powershell("$ErrorActionPreference='Stop'; "
-                    "$identity=[System.Security.Principal.WindowsIdentity]::GetCurrent().Name; "
+                    "$identity=[System.Security.Principal.WindowsIdentity]::GetCurrent(); "
+                    "$acl=Get-Acl -LiteralPath $env:DF_MCP_TEST_RESTRICTED_PARENT; "
+                    "$acl.GetSecurityDescriptorSddlForm([System.Security.AccessControl.AccessControlSections]::All) | "
+                    "Set-Content -LiteralPath $env:DF_MCP_TEST_ACL_BACKUP -Encoding UTF8; "
+                    "$deny=[System.Security.AccessControl.FileSystemAccessRule]::new($identity.User, "
+                    "[System.Security.AccessControl.FileSystemRights]::ListDirectory, "
+                    "[System.Security.AccessControl.InheritanceFlags]::None, "
+                    "[System.Security.AccessControl.PropagationFlags]::None, "
+                    "[System.Security.AccessControl.AccessControlType]::Deny); "
+                    "$acl.AddAccessRule($deny); Set-Acl -LiteralPath $env:DF_MCP_TEST_RESTRICTED_PARENT -AclObject $acl; "
                     "New-SmbShare -Name $env:DF_MCP_TEST_SHARE_NAME -Path $env:DF_MCP_TEST_SHARE_PATH "
-                    "-ReadAccess $identity -CachingMode None -ErrorAction Stop | Out-Null; "
+                    "-ReadAccess $identity.Name -CachingMode None -ErrorAction Stop | Out-Null; "
                     "Write-Output 'SIMULATED_SMB_CREATED'")
                 self.assertEqual(setup.returncode, 0,
                     "Native SMB fixture was not created. This explicit test requires Administrator rights and an already running Server service; "
                     "no service/firewall was changed. " + setup.stderr[-1500:])
                 self.assertIn("SIMULATED_SMB_CREATED", setup.stdout)
-                config = base / "profile.json"
-                state = base / "LOCAL_INDEX"
-                config.write_text(json.dumps({"provider": "windows_share", "root": "\\\\localhost\\" + name,
-                                              "state_dir": str(state)}), encoding="utf-8")
+                share_root = Path("\\\\localhost\\" + name)
+                unc_parent = share_root / restricted.name
+                unc_source = unc_parent / source.name
+                # Prove the fixture reproduces the reported permission mismatch;
+                # a test that silently grants parent read would miss the defect.
+                with self.assertRaises(OSError) as denied:
+                    fs_access._handle(unc_parent, directory=True)
+                self.assertEqual(denied.exception.errno, 5)
+                handle = fs_access._handle(unc_parent, directory=True, attributes_only=True)
+                try:
+                    self.assertTrue(stat.S_ISDIR(fs_access._share_info(handle).st_mode))
+                finally:
+                    fs_access._kernel.CloseHandle(handle)
+                handle = fs_access._handle(unc_source, directory=True)
+                fs_access._kernel.CloseHandle(handle)
+
+                state_base = base / "LOCAL_INDEX"
+                plan = make_plan("team", str(unc_source), state_dir=str(state_base))
+                self.assertFalse(state_base.exists(), "A successful plan must not create an index")
+                with self.assertRaises(DriveError) as unconfirmed:
+                    apply_plan(plan)
+                self.assertEqual(unconfirmed.exception.code, "CONFIRMATION_REQUIRED")
+                applied = apply_plan(plan, confirmed=True)
+                config = Path(applied["config_path"])
+                state = Path(plan["config"]["state_dir"])
+                self.assertIn(state_base, state.parents)
+                self.assertFalse(str(state).startswith("\\\\"))
                 engine = Engine(str(config), autostart=False)
-                # Fail at the actual native stage before a generic inventory
-                # assertion can hide handle/path/protocol incompatibilities.
-                self.assertEqual(engine._source._native.observe("budget.csv").st_size, document.stat().st_size)
+                self.assertEqual(engine._source._native.observe("nested/budget.csv").st_size, document.stat().st_size)
                 self.assertEqual(engine.scan_once()["job"]["status"], "complete")
                 file = engine.search("SIMULATED_TRAVEL")["files"][0]
-                read = engine.read(file["file_id"], expected_version=file["source_version"])
+                inspected = engine.inspect(file["file_id"])
+                self.assertTrue(inspected["structure"])
+                read = engine.read(file["file_id"], expected_version=inspected["source_version"])
                 self.assertEqual(read["origin"]["provider"], "windows_share")
                 self.assertEqual(read["origin"]["source_version"], read["source_version"])
+                self.assertEqual(read["source_version"], inspected["source_version"])
+                self.assertTrue(read["segments"])
+                self.assertTrue(all(segment.get("locator") for segment in read["segments"]))
+                self.assertIn("SIMULATED_TRAVEL", json.dumps(read["segments"]))
                 self.assertEqual(engine.state, state)
-                self.assertEqual([child.name for child in source.iterdir()], ["budget.csv"])
-                replacement = source / "replacement.csv"
+                self.assertTrue(inspected["coverage"]["inventory_complete"])
+                self.assertEqual(document.read_text(encoding="utf-8"), "category,amount\nSIMULATED_TRAVEL,120\n")
+                replacement = nested / "replacement.csv"
                 replacement.write_text("category,amount\nSIMULATED_TRAVEL,999\n", encoding="utf-8")
                 # The broker is still alive. An ordinary external atomic save
                 # must work between operations without special native helpers.
@@ -470,14 +671,20 @@ class NativeLocalhostSMBTests(unittest.TestCase):
                     if engine is not None:
                         engine.close()
                 finally:
-                    # Also clean up an uncertain setup outcome (e.g. timeout).
-                    # The name and exact path are unique to this test fixture.
-                    removed = powershell("$ErrorActionPreference='Stop'; "
+                    # Restore only this fixture's saved ACL, even if setup or
+                    # assertion failed. Always remove the matching unique share.
+                    removed = powershell("$ErrorActionPreference='Stop'; $restoreFailure=$null; "
+                        "try { if (Test-Path -LiteralPath $env:DF_MCP_TEST_ACL_BACKUP) { "
+                        "$acl=Get-Acl -LiteralPath $env:DF_MCP_TEST_RESTRICTED_PARENT; "
+                        "$acl.SetSecurityDescriptorSddlForm((Get-Content -LiteralPath $env:DF_MCP_TEST_ACL_BACKUP -Raw).Trim()); "
+                        "Set-Acl -LiteralPath $env:DF_MCP_TEST_RESTRICTED_PARENT -AclObject $acl "
+                        "} } catch { $restoreFailure=$_ }; "
                         "$share=Get-SmbShare -Name $env:DF_MCP_TEST_SHARE_NAME -ErrorAction SilentlyContinue; "
                         "if ($null -ne $share) { "
                         "if ($share.Path -ne $env:DF_MCP_TEST_SHARE_PATH) { throw 'Unexpected synthetic share target' }; "
-                        "Remove-SmbShare -Name $env:DF_MCP_TEST_SHARE_NAME -Force -Confirm:$false -ErrorAction Stop }")
-                    self.assertEqual(removed.returncode, 0, "Synthetic share cleanup failed: " + removed.stderr[-1000:])
+                        "Remove-SmbShare -Name $env:DF_MCP_TEST_SHARE_NAME -Force -Confirm:$false -ErrorAction Stop }; "
+                        "if ($null -ne $restoreFailure) { throw $restoreFailure }")
+                    self.assertEqual(removed.returncode, 0, "Synthetic share/ACL cleanup failed: " + removed.stderr[-1000:])
 
 
 if __name__ == "__main__":

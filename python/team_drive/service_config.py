@@ -11,7 +11,7 @@ from .fs_access import validate_state_location
 from .retrieval import validate_config as retrieval_settings
 from .diagnostics import settings as diagnostic_settings
 
-SERVICE_VERSION = "0.6.0"
+SERVICE_VERSION = "0.6.1"
 PROTOCOL_VERSION = 1
 
 

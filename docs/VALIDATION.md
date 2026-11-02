@@ -1,5 +1,15 @@
 # 验证记录
 
+## 0.6.1 / 2026-11-02：网络资料根外祖先权限
+
+修复仅对网络资料根之外的严格祖先申请 FILE_READ_ATTRIBUTES；资料根、内部目录及文件保留 GENERIC_READ。固定根按路径组件校验，首次与重新打开保存并复用相同模式。新增 Windows 回归覆盖父目录权限不足、根/文件不可回退、类似前缀旁支、身份/目标/重解析点变化及普通本地目录。
+
+本地 macOS 回归实际执行 363 项（338 通过、25 项按平台条件跳过），包含完整 ZIP 禁用系统 site-packages 的初始化、检索与独立索引复用。TypeScript 构建及本地/模拟 Graph 的 13 工具 MCP 集成通过，确认服务版本为 0.6.1。Windows API 的内存模拟不等于原生测试。
+
+Windows CI 的临时 localhost SMB 用不继承的 deny ListDirectory ACE 构造上级只可读属性、目标可读取的权限组合；先证明旧权限请求被拒绝，再执行 plan、确认 apply、索引、inspect/read 和文件替换，最后恢复临时 ACL 并删除唯一测试共享。测试不连接公司磁盘，也不改公司权限。该提交原生 Windows 及跨平台结果以 Actions 为准。
+
+公司 Windows 的正式安装、N 盘、DFS、实际账号和真实文件验收尚未执行；需按包内 windows-share-acceptance.md 核对正式版本、来源和本地索引，完成实际文件读取。plan 成功不等于索引或读取验收成功。
+
 ## 0.6.0 / 2026-10-30：两选项 Skill ZIP、网络公盘与云盘目录选择
 
 新增 A 团队公盘/云盘、B 本地磁盘初始化，显式 plan/apply 与持久源身份绑定；完整 ZIP 携带 Python 核心与固定解析依赖，无需 Node 使用 CLI。新增 windows_share 只读适配和 Windows 本机 IPC 同用户检查，补充 SharePoint/OneDrive 有界目录发现、直接文件夹链接解析及不依赖 drive/folder 的显式登录入口。
