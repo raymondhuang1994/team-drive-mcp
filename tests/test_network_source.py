@@ -586,7 +586,12 @@ class NativeLocalhostSMBTests(unittest.TestCase):
             document.write_text("category,amount\nSIMULATED_TRAVEL,120\n", encoding="utf-8")
             name = "df_simulated_" + uuid.uuid4().hex
             backup = base / "synthetic-parent-acl.txt"
-            env = dict(os.environ, DF_MCP_TEST_SHARE_NAME=name, DF_MCP_TEST_SHARE_PATH=str(shared),
+            # Actions invokes this test from pwsh 7. Its inherited module path
+            # can make Windows PowerShell 5 load incompatible Security modules.
+            # Let this child initialize its own defaults; do not modify the
+            # parent process or machine/user PowerShell configuration.
+            env = {key: value for key, value in os.environ.items() if key.casefold() != "psmodulepath"}
+            env.update(DF_MCP_TEST_SHARE_NAME=name, DF_MCP_TEST_SHARE_PATH=str(shared),
                        DF_MCP_TEST_RESTRICTED_PARENT=str(restricted), DF_MCP_TEST_ACL_BACKUP=str(backup))
 
             def powershell(command):
