@@ -701,29 +701,37 @@ if os.name == "nt":
         def stat_fd(self, fd):
             return _share_info(msvcrt.get_osfhandle(fd)) if self.network else os.fstat(fd)
 
-        def observe(self, relative, parent_identity=None):
+        def observe(self, relative, parent_identity=None, progress=None):
             """Fresh no-follow metadata, including excluded files; no content read."""
-            self.check_root()
+            if not self.network:
+                self.check_root()
             path = self.root.joinpath(*relative_parts(relative))
-            guard = self._parent_guard(path.parent)
+            # A fresh network parent guard already checks the complete approved
+            # root/ancestor chain. Opening that chain separately immediately
+            # before it adds SMB requests but no additional scope check. Never
+            # reuse this guard across items, recursive visits or yielded rows.
+            with progress.operation("directory_validation") if progress is not None else contextlib.nullcontext():
+                guard = self._parent_guard(path.parent)
             handle = None
             try:
                 if parent_identity is not None and guard.identities[-1][1:] != parent_identity:
                     raise DriveError("SHARE_DIRECTORY_CHANGED", "A shared parent directory changed during enumeration.")
-                handle = _handle(path, directory=True)
-                info = _share_info(handle) if self.network else _file_info(handle)
-                target = _final_path(handle)
-                if target != self._expected_target(path) or _kernel.GetFileType(handle) != 1:
-                    raise DriveError("SHARE_ROOT_CHANGED", "The shared item resolves outside its approved target.")
+                with progress.operation("native_metadata") if progress is not None else contextlib.nullcontext():
+                    handle = _handle(path, directory=True)
+                    info = _share_info(handle) if self.network else _file_info(handle)
+                    target = _final_path(handle)
+                    if target != self._expected_target(path) or _kernel.GetFileType(handle) != 1:
+                        raise DriveError("SHARE_ROOT_CHANGED", "The shared item resolves outside its approved target.")
                 return info
             finally:
                 if handle is not None:
                     _kernel.CloseHandle(handle)
                 guard.close()
 
-        def walk(self, errors, max_depth=None, max_items=None, deadline=None):
+        def walk(self, errors, max_depth=None, max_items=None, deadline=None, progress=None):
             if self.network:
-                yield from self._walk_network(errors, max_depth=max_depth, max_items=max_items, deadline=deadline)
+                yield from self._walk_network(errors, max_depth=max_depth, max_items=max_items,
+                                              deadline=deadline, progress=progress)
                 return
             self.check_root()
             def visit(folder, prefix):
@@ -758,7 +766,7 @@ if os.name == "nt":
                     guard.close()
             yield from visit(self.root, "")
 
-        def _walk_network(self, errors, max_depth=None, max_items=None, deadline=None):
+        def _walk_network(self, errors, max_depth=None, max_items=None, deadline=None, progress=None):
             """Pin only enumeration/observation windows; verify each directory.
 
             No handle spans a yielded manifest item or a recursive visit. A
@@ -775,32 +783,49 @@ if os.name == "nt":
             def signature(info):
                 return (info.st_dev, info.st_ino, info.st_mtime_ns, info.st_ctime_ns)
 
+            def operation(name):
+                return progress.operation(name) if progress is not None else contextlib.nullcontext()
+
             def visit(folder, prefix, expected_identity=None):
                 nonlocal count
                 budget()
                 if max_depth is not None and len(PurePosixPath(prefix).parts) > max_depth:
                     raise DriveError("SHARE_SCAN_LIMIT", "The shared-folder scan exceeded its directory depth limit.")
-                guard = self._parent_guard(folder)
+                if progress is not None:
+                    progress.set_stage("enumerating")
+                with operation("directory_validation"):
+                    guard = self._parent_guard(folder)
                 try:
-                    before = _share_info(guard.handles[-1])
+                    with operation("native_metadata"):
+                        before = _share_info(guard.handles[-1])
                     identity = (before.st_dev, before.st_ino)
                     if expected_identity is not None and identity != expected_identity:
                         raise DriveError("SHARE_DIRECTORY_CHANGED", "A shared directory was replaced before enumeration.")
                     names = []
-                    with os.scandir(folder) as entries:
-                        for entry in entries:
-                            budget()
-                            count += 1
-                            if max_items is not None and count > max_items:
-                                raise DriveError("SHARE_SCAN_LIMIT", "The shared-folder scan exceeded its item limit.")
-                            names.append(entry.name)
+                    with operation("directory_enumeration"):
+                        with os.scandir(folder) as entries:
+                            for entry in entries:
+                                budget()
+                                count += 1
+                                if progress is not None:
+                                    progress.increment("entries_enumerated")
+                                if max_items is not None and count > max_items:
+                                    raise DriveError("SHARE_SCAN_LIMIT", "The shared-folder scan exceeded its item limit.")
+                                names.append(entry.name)
+                    if progress is not None:
+                        progress.increment("directories_enumerated")
                 finally:
                     guard.close()
                 for name in names:
                     budget()
                     _windows_component(name)
                     relative = (PurePosixPath(prefix) / name).as_posix()
-                    info = self.observe(relative, parent_identity=identity)
+                    if progress is not None:
+                        progress.set_stage("verifying")
+                    with operation("item_observation"):
+                        info = self.observe(relative, parent_identity=identity, progress=progress)
+                    if progress is not None:
+                        progress.increment("items_verified")
                     reparse = bool(info.st_file_attributes & _REPARSE)
                     online = online_only(info) or (reparse and getattr(info, "st_reparse_tag", 0) & 0xFFFF0FFF == 0x9000001A)
                     if stat.S_ISDIR(info.st_mode) and not reparse and not online:
@@ -809,9 +834,13 @@ if os.name == "nt":
                         blocked = not online and (reparse or not stat.S_ISREG(info.st_mode) or info.st_nlink != 1)
                         yield relative, info, blocked, online
                 budget()
-                guard = self._parent_guard(folder)
+                if progress is not None:
+                    progress.set_stage("verifying")
+                with operation("directory_validation"):
+                    guard = self._parent_guard(folder)
                 try:
-                    after = _share_info(guard.handles[-1])
+                    with operation("native_metadata"):
+                        after = _share_info(guard.handles[-1])
                     if signature(before) != signature(after):
                         raise DriveError("SHARE_DIRECTORY_CHANGED", "A shared directory changed while its inventory was being collected.", True,
                                          "Retry after directory updates finish; the previous inventory has not been replaced.")
@@ -819,9 +848,15 @@ if os.name == "nt":
                     guard.close()
 
             try:
-                self.check_root()
+                if progress is not None:
+                    progress.set_stage("validating_root")
+                with operation("root_validation"):
+                    self.check_root()
                 yield from visit(self.root, "")
-                self.check_root()
+                if progress is not None:
+                    progress.set_stage("validating_root")
+                with operation("root_validation"):
+                    self.check_root()
             except (OSError, DriveError) as exc:
                 errors.append(True)
                 if isinstance(exc, DriveError):

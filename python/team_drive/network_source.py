@@ -6,6 +6,7 @@ not advertised as cancellation of an in-flight SMB request.
 """
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import math
@@ -145,23 +146,32 @@ class WindowsShareSource:
         with self._lock:
             return dict(self._metadata.get(relative, {}))
 
-    def walk(self, errors):
+    def walk(self, errors, progress=None):
         """Publish only a complete manifest. Any inaccessible subtree aborts it."""
         deadline = time.monotonic() + self.limits["scan_budget_seconds"]
         pending, metadata, walk_errors = [], {}, []
         try:
-            self.check_root()
+            if progress is not None:
+                progress.set_stage("validating_root")
+            with progress.operation("root_validation") if progress is not None else contextlib.nullcontext():
+                self.check_root()
             for relative, info, blocked, online in self._native.walk(
-                    walk_errors, max_depth=self.limits["max_depth"], max_items=self.limits["max_items"], deadline=deadline):
+                    walk_errors, max_depth=self.limits["max_depth"], max_items=self.limits["max_items"],
+                    deadline=deadline, progress=progress):
                 self._deadline(deadline)
                 relative_parts(relative)
                 if len(pending) >= self.limits["max_items"]:
                     raise _error("SHARE_SCAN_LIMIT", "The shared-folder scan exceeds its item limit.")
                 pending.append((relative, info, blocked, online))
                 metadata[relative] = self._origin(relative, info)
+                if progress is not None:
+                    progress.increment("pending_items")
             if walk_errors:
                 raise _error("SHARE_SCAN_INCOMPLETE", "At least one shared folder or item could not be checked; the inventory was not replaced.")
-            self.check_root()
+            if progress is not None:
+                progress.set_stage("validating_root")
+            with progress.operation("root_validation") if progress is not None else contextlib.nullcontext():
+                self.check_root()
             self._deadline(deadline)
             with self._lock:
                 self._metadata = metadata
@@ -170,6 +180,8 @@ class WindowsShareSource:
             if isinstance(exc, DriveError):
                 raise
             raise _error("SHARE_UNAVAILABLE", "The shared folder could not be enumerated under the current Windows identity.") from None
+        if progress is not None:
+            progress.set_stage("publishing")
         yield from pending
 
     def digest(self, relative, snapshot=None, deadline=None):

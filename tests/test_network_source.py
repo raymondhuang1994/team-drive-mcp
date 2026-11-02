@@ -20,6 +20,31 @@ from team_drive.network_source import WindowsShareSource, normalize_share_path, 
 from team_drive.service_config import settings
 
 
+class _RecordingScanProgress:
+    """Observe the scan's public progress contract without timing real I/O."""
+    def __init__(self):
+        self.counters, self.stages, self.operations, self.active = {}, [], [], []
+
+    def set_stage(self, name):
+        self.stages.append(name)
+
+    def increment(self, name, n=1):
+        self.counters[name] = self.counters.get(name, 0) + n
+
+    @contextlib.contextmanager
+    def operation(self, name):
+        self.operations.append(name)
+        self.active.append(name)
+        try:
+            yield
+        finally:
+            self.active.pop()
+
+    def snapshot(self):
+        return {"counters": dict(self.counters), "stage": self.stages[-1] if self.stages else None,
+                "operations": list(self.operations), "active": list(self.active)}
+
+
 class ShareSyntaxTests(unittest.TestCase):
     def test_unc_anchor_trailing_slash_has_one_canonical_spelling(self):
         from pathlib import PureWindowsPath
@@ -329,6 +354,108 @@ class AncestorAccessTests(unittest.TestCase):
                 self.assertTrue(tree.calls)
                 self.assertEqual({access for _path, access, *_ in tree.calls}, {0x80000000})
 
+    def test_network_observation_opens_one_fresh_chain_per_item(self):
+        with self.native_tree() as tree:
+            source = fs_access.WindowsSource(tree.root, allow_network=True)
+            try:
+                # Reproduce the previous two-chain sequence with the actual
+                # guard and mocked native calls, then compare the new path.
+                tree.calls.clear()
+                source.check_root()
+                source.observe("nested/budget.csv")
+                previous = list(tree.calls)
+                tree.calls.clear()
+                source.observe("nested/budget.csv")
+                current = list(tree.calls)
+                root = fs_access.canonical_windows_path(tree.root)
+                self.assertEqual(sum(path == root for path, *_ in previous), 2)
+                self.assertEqual(sum(path == root for path, *_ in current), 1)
+                self.assertEqual(len(previous) - len(current), len(tree.root.parts))
+                self.assertEqual(len(current), len((tree.root / "nested").parts) + 1)
+                self.assert_source_modes(tree)
+                # A successful item never supplies a cached permission decision
+                # for the next one, even with the same parent and filename.
+                tree.denied.add((root, 0x80000000))
+                with self.assertRaises(DriveError):
+                    source.observe("nested/budget.csv")
+            finally:
+                source.close()
+
+    def test_network_observation_keeps_chain_parent_and_target_checks(self):
+        for change in ("ancestor_access", "ancestor_identity", "ancestor_target", "ancestor_reparse",
+                       "root_identity", "root_target", "root_reparse", "file_access", "file_target",
+                       "parent_identity", "parent_reparse", "traversal"):
+            with self.subTest(change=change), self.native_tree() as tree:
+                source = fs_access.WindowsSource(tree.root, allow_network=True)
+                ancestor = fs_access.canonical_windows_path(tree.root.parent)
+                root = fs_access.canonical_windows_path(tree.root)
+                file = fs_access.canonical_windows_path(tree.root / "nested" / "budget.csv")
+                if change == "ancestor_access":
+                    tree.denied.add((ancestor, 0x80))
+                elif change == "ancestor_identity":
+                    tree.changed.add(ancestor)
+                elif change == "ancestor_target":
+                    tree.targets[ancestor] = r"\\other-server\outside\Department"
+                elif change == "ancestor_reparse":
+                    tree.reparse.add(ancestor)
+                elif change == "root_identity":
+                    tree.changed.add(root)
+                elif change == "root_target":
+                    tree.targets[root] = r"\\other-server\outside\Approved"
+                elif change == "root_reparse":
+                    tree.reparse.add(root)
+                elif change == "file_access":
+                    tree.denied.add((file, 0x80000000))
+                elif change == "file_target":
+                    tree.targets[file] = r"\\other-server\outside\budget.csv"
+                elif change == "parent_reparse":
+                    tree.reparse.add(fs_access.canonical_windows_path(tree.root / "nested"))
+                try:
+                    with self.assertRaises((DriveError, OSError)):
+                        source.observe("../outside.csv" if change == "traversal" else "nested/budget.csv",
+                                       parent_identity=(7, -1) if change == "parent_identity" else None)
+                finally:
+                    source.close()
+
+    def test_local_observation_still_rechecks_its_pinned_root(self):
+        with self.native_tree() as tree:
+            source = fs_access.WindowsSource(Path(r"C:\synthetic\local"))
+            try:
+                with mock.patch.object(source.guard, "check", wraps=source.guard.check) as check:
+                    source.observe("budget.csv")
+                check.assert_called_once_with()
+            finally:
+                source.close()
+
+    def test_native_scan_progress_counts_directories_and_items_without_pinning_yields(self):
+        with self.native_tree() as tree:
+            source = fs_access.WindowsSource(tree.root, allow_network=True)
+            progress = _RecordingScanProgress()
+            listings = {tree.root: ["nested", "budget.csv"], tree.root / "nested": ["notes.csv"]}
+            @contextlib.contextmanager
+            def scandir(path):
+                self.assertIn("directory_enumeration", progress.active)
+                self.assertEqual(progress.stages[-1], "enumerating")
+                yield iter(SimpleNamespace(name=name) for name in listings[path])
+            try:
+                rows = []
+                with mock.patch.object(fs_access.os, "scandir", side_effect=scandir):
+                    for row in source.walk([], progress=progress):
+                        rows.append(row[0])
+                        self.assertEqual(set(tree.closed), set(tree.handles),
+                                         "No source guard may remain held across a yielded item")
+                self.assertEqual(set(rows), {"budget.csv", "nested/notes.csv"})
+                self.assertEqual(progress.counters, {"directories_enumerated": 2, "entries_enumerated": 3,
+                                                    "items_verified": 3})
+                self.assertEqual(progress.operations.count("root_validation"), 2)
+                self.assertEqual(progress.operations.count("directory_enumeration"), 2)
+                self.assertEqual(progress.operations.count("item_observation"), 3)
+                self.assertEqual(progress.operations.count("directory_validation"), 7)
+                self.assertEqual(progress.operations.count("native_metadata"), 7)
+                self.assertEqual(progress.active, [])
+            finally:
+                source.close()
+
 
 class SyntheticShareTests(unittest.TestCase):
     def setUp(self):
@@ -457,6 +584,70 @@ class SyntheticShareTests(unittest.TestCase):
         self.assertTrue(errors)
         self.assertEqual(self.source.evidence("budget.csv"), before)
         self.assertEqual(self.source.evidence("new.csv"), {})
+
+    def test_progress_can_show_unpublished_items_when_scan_times_out(self):
+        self.write()
+        list(self.source.walk([]))
+        before = self.source.evidence("budget.csv")
+        self.write("new.csv")
+        progress = _RecordingScanProgress()
+        clock = [10.0]
+        info = self.source._native.observe("budget.csv")
+
+        def interrupted_walk(errors, **options):
+            self.assertIs(options["progress"], progress)
+            progress.set_stage("enumerating")
+            with progress.operation("directory_enumeration"):
+                progress.increment("directories_enumerated")
+                progress.increment("entries_enumerated", 2)
+            progress.set_stage("verifying")
+            progress.increment("items_verified")
+            yield "budget.csv", info, False, False
+            self.assertEqual(progress.counters["pending_items"], 1)
+            self.assertEqual(self.source.evidence("new.csv"), {})
+            # This is elapsed time at an I/O boundary, not a real sleep and
+            # not a claim that an in-flight native call can be interrupted.
+            clock[0] += 121
+            progress.increment("items_verified")
+            yield "new.csv", info, False, False
+
+        rows, errors = [], []
+        with mock.patch.object(self.source._native, "walk", side_effect=interrupted_walk), \
+                mock.patch("team_drive.network_source.time.monotonic", side_effect=lambda: clock[0]):
+            with self.assertRaises(DriveError) as caught:
+                for row in self.source.walk(errors, progress=progress):
+                    rows.append(row)
+        self.assertEqual(caught.exception.code, "SHARE_TIMEOUT")
+        self.assertEqual(rows, [], "A failed scan must not yield its partial manifest")
+        self.assertTrue(errors)
+        self.assertEqual(progress.counters, {"directories_enumerated": 1, "entries_enumerated": 2,
+                                             "items_verified": 2, "pending_items": 1})
+        self.assertEqual(self.source.evidence("budget.csv"), before)
+        self.assertEqual(self.source.evidence("new.csv"), {})
+        self.assertNotIn("publishing", progress.stages)
+
+    def test_progress_reports_publish_only_after_final_scope_checks(self):
+        self.write()
+        progress = _RecordingScanProgress()
+        actual = list(self.source.walk([], progress=progress))
+        self.assertEqual(len(actual), 1)
+        self.assertEqual(progress.counters["pending_items"], 1)
+        self.assertEqual(progress.stages[-1], "publishing")
+        self.assertEqual(progress.operations.count("root_validation"), 2)
+        self.assertEqual(progress.active, [])
+        self.assertTrue(self.source.evidence("budget.csv"))
+        # A final mapping change discards the next manifest even if every
+        # file was already observed and queued for publication.
+        original_walk = self.source._native.walk
+        def changed_after_rows(errors, **options):
+            yield from original_walk(errors, **options)
+            self.mapping = r"\\synthetic-server\different"
+        progress = _RecordingScanProgress()
+        with mock.patch.object(self.source._native, "walk", side_effect=changed_after_rows), self.assertRaises(DriveError):
+            list(self.source.walk([], progress=progress))
+        self.assertEqual(progress.counters["pending_items"], 1)
+        self.assertNotIn("publishing", progress.stages)
+        self.assertEqual(progress.active, [])
 
     def test_mapping_and_identity_changes_reject_prior_scope(self):
         old = self.mapping

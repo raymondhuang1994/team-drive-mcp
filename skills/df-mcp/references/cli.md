@@ -24,6 +24,20 @@ For file reads, pass the exact expected_version from inspect/read. Multiple list
 
 A first status starts the configured local broker and its initial scan. Distinguish connectivity, scanning, and usable coverage. Call status, then job_status for current_job_id. A bounded `--wait-ready 30` can wait for the initial job; a timeout is not a failed index and must not trigger a second index directory. Report unsupported/failed/partial files even when a scan finishes. Scanning polls only while the broker is alive; it is not an installed unattended background service.
 
+## Acceptance report for an already confirmed configuration
+
+```text
+python scripts/df-check.py --config <saved-config.json> --confirmed-config --wait-ready 30
+```
+
+Use this for an explicit acceptance or diagnostic request, not ordinary evidence questions. The flag means the actual source, subfolder scope and independent index location already have user confirmation. Connecting may start indexing; without this flag the helper fails before connecting. It does not install, apply, force refresh, cancel or alter the source.
+
+The helper checks the connected version against its loaded runtime, polls the same job using job_status, and returns coverage plus bounded scan progress/error details. Failed or unfinished indexing prevents sample/read and search checks. When ready, it scans at most 10 list pages for one ready supported file, inspects it, and reads at most 3 segments with the inspected version. It reports version equality, nonempty text and locator presence, but those checks do not establish business correctness or locator accuracy; verify those locally with normal inspect/read tools. A discovery budget stop does not prove that no suitable files exist.
+
+Optional `--query <keyword>` runs that same keyword twice with limit=10 and rerank=false, without including it in the report. Pass arguments safely rather than interpolating arbitrary text into a shell. Query timings cover tool round trips on one connection, excluding CLI startup; connection and total timings are separate. Empty/incomplete results or changed index generation are not representative performance evidence.
+
+stdout is one allowlisted JSON report, with exit 0 only when automatic technical checks pass. It excludes file names, paths, identity, text, query and raw exception messages/tracebacks. Save it as UTF-8 in the approved local working area if requested. `business_accuracy=requires_local_human_review` remains true as a requirement even when technical checks pass. Wait-ready accepts 0–120 seconds and is checked between calls, not a hard cancellation deadline for native I/O. Only the current configured provider is tested.
+
 ## Persistence and host location
 
 The broker reuses the same configured index across invocations/chats. Last-client idle shutdown keeps committed state. Other chats use independent session cursors. This is per-user local IPC, not a multi-user web server.

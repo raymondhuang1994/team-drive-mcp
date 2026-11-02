@@ -47,7 +47,8 @@ def default_state_base():
         root = os.environ.get("LOCALAPPDATA")
         if not root or not ntpath.isabs(root):
             _fail("UNSAFE_STATE", "LOCALAPPDATA is unavailable; specify a private fixed local state directory.")
-        return Path(root) / "df-mcp"
+        from .state_path import windows_default_state_base
+        return windows_default_state_base(root)
     if sys.platform == "darwin":
         return Path.home() / "Library" / "Application Support" / "df-mcp"
     root = os.environ.get("XDG_STATE_HOME")
@@ -75,6 +76,9 @@ def _local_path(value):
             _fail("UNSAFE_STATE", "State paths cannot traverse symbolic links, junctions or reparse points.")
         if current != path and not stat.S_ISDIR(info.st_mode):
             _fail("UNSAFE_STATE", "State ancestors must be ordinary directories.")
+    if os.name == "nt":
+        from .state_path import canonical_windows_state_path
+        return canonical_windows_state_path(path)
     return path.resolve()
 
 
@@ -339,6 +343,10 @@ def _private_config(path):
         directory = _CacheDirectory(path)
     except FileNotFoundError:
         return None
+    except DriveError as exc:
+        if exc.code == "AUTH_CACHE_UNSAFE":
+            _fail("STATE_PATH_UNSAFE", "The local configuration directory failed its path or access checks.")
+        raise
     try:
         try:
             descriptor = directory.open(Path(path).name)
@@ -362,12 +370,17 @@ def _private_config(path):
 def _save_config(path, config):
     """Exclusive creation inside a pinned private directory; never overwrite."""
     from .graph_auth import _CacheDirectory
-    directory = _CacheDirectory(path, create=True)
+    try:
+        directory = _CacheDirectory(path, create=True)
+    except DriveError as exc:
+        if exc.code == "AUTH_CACHE_UNSAFE":
+            _fail("STATE_PATH_UNSAFE", "The local configuration directory failed its path or access checks.")
+        raise
     try:
         directory.check()
         flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_BINARY", 0)
         if os.name == "nt":
-            descriptor = os.open(path, flags, 0o600)
+            descriptor = os.open(directory.path, flags, 0o600)
         else:
             descriptor = os.open(Path(path).name, flags, 0o600, dir_fd=directory.fd)
         with os.fdopen(descriptor, "wb") as target:
@@ -375,6 +388,7 @@ def _save_config(path, config):
             target.flush()
             os.fsync(target.fileno())
         directory.check()
+        return Path(directory.path)
     finally:
         directory.close()
 
@@ -555,7 +569,7 @@ def apply_plan(plan, confirmed=False):
     reused = existing is not None
     if not reused:
         try:
-            _save_config(path, config)
+            path = _save_config(path, config)
         except FileExistsError:
             _fail("CONFIG_CHANGED", "A configuration was created concurrently; run apply again to validate and reuse it.")
     return {"ok": True, "config_path": str(path), "provider": config["provider"], "source": plan["source"],

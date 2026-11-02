@@ -17,7 +17,7 @@ python -B -c "import sys;sys.path.insert(0,'scripts');from _df_runtime import bo
 python scripts/df-init.py profiles
 ```
 
-运行时应为 `0.6.1`，模块路径应落在当前正式安装的 `runtime/python/team_drive` 中。SkillHub 的显示版本（例如 `0.2.0`）独立管理，不能用它判断内置程序版本。已有配置使用自定义状态基目录时，`profiles` 需传原来的 `--state-dir`；不要扫描整台电脑寻找配置。
+运行时应为 `0.6.2`，模块路径应落在当前正式安装的 `runtime/python/team_drive` 中。SkillHub 的显示版本（例如 `0.2.0`）独立管理，不能用它判断内置程序版本。已有配置使用自定义状态基目录时，`profiles` 需传原来的 `--state-dir`；不要扫描整台电脑寻找配置。
 
 ## 2. 正式计划：先检查来源和本地索引位置
 
@@ -47,7 +47,21 @@ Windows 默认状态基目录为 `%LOCALAPPDATA%\df-mcp`。如用户明确指定
 python scripts/df-init.py apply --plan <保存的完整plan.json> --confirmed
 ```
 
-使用返回的实际 `config_path`，不根据哈希目录名称自行拼接。apply 成功表示配置保存，尚不能宣布索引完成。随后：
+使用返回的实际 `config_path`，不根据哈希目录名称自行拼接。apply 成功表示配置保存，尚不能宣布索引完成。已有完全一致且获确认的配置直接复用，不重新 apply。
+
+0.6.2 提供统一复测入口。首次连接会启动索引，因此仅在上面的实际配置已获确认后传 `--confirmed-config`：
+
+```text
+python scripts/df-check.py --config <实际config_path> --confirmed-config --wait-ready 30
+```
+
+如需比较同一关键词两次查询耗时，追加 `--query <用户提供的关键词>`，用可靠参数传递保留原文；关键词不进入报告。该入口保持同一连接，核对实际服务与包内版本，跟踪同一任务，扫描未完成或失败时直接报告进度及错误。扫描完成后，最多查 10 页文件清单并选择首个 ready 的支持格式文件，执行 inspect 和最多 3 个片段的同版本 read；有查询参数时随后执行两次 keyword 查询。它不安装、保存配置、强制刷新、取消任务或创建第二个索引。
+
+stdout 是可回传的脱敏 JSON，可由本地 GPT 用 UTF-8 保存到获准的本地验收目录；不要存到资料源。报告包含计数、耗时、错误码和技术核对结果，不含公司身份、文件名、路径、正文、查询或原始堆栈。`ok:true` 仅表示这轮自动技术检查通过；`business_accuracy=requires_local_human_review` 表示正文与定位仍需第 4 节本地核对。空结果、空索引、不完整扫描或变化中的 generation 不用于宣称检索性能合格。工具查询计时不含 CLI 启动，连接和总耗时单独列出。
+
+等待上限为 120 秒，在工具调用之间检查；不承诺硬取消正在阻塞的 Windows I/O。等待结束不等于取消索引。`index_not_ready` 可继续观察既有任务；`index_task_failed` 先处理所报原因，不反复重建。`sample_page_budget` 只表示样本发现预算耗尽，不能解释为资料源没有可读文件。完整复测也只验收当前配置的 provider，不证明其他网络盘或微软租户已验证。
+
+需要进一步查看原始状态时使用：
 
 ```text
 python scripts/df-tool.py status --config <返回的config_path> --wait-ready 30
@@ -56,7 +70,7 @@ python scripts/df-tool.py job_status --config <返回的config_path> --params-fi
 
 `job.json` 为 `{"job_id":"<status实际返回的current_job_id>"}`。若没有 current_job_id，可不传 params-file 查询最新任务，并结合 status 的覆盖情况解释结果。`INDEX_STILL_RUNNING` 表示这次等待结束，继续检查既有任务；不创建第二个索引。任务 failed/cancelled 或来源不可访问时，保留失败状态，不能从旧缓存声称当前资料可读。
 
-核对实际 `service_version` 为 `0.6.1`、provider 为 `windows_share`，来源绑定与确认卡一致。报告任务状态和 `coverage` 的 `inventory_complete`、`present_files`、`indexed_files`、`partial_files`、`states`。明确列出 failed/blocked/unsupported/online_only/oversized/pending 等实际缺口；需要具体文件时用下面的 list 返回其 `error`、`format_warnings` 和 `content_coverage`。未完成全量分页时不得声称已列尽所有失败文件。
+核对实际 `service_version` 为 `0.6.2`、provider 为 `windows_share`，来源绑定与确认卡一致。报告任务状态和 `coverage` 的 `inventory_complete`、`present_files`、`indexed_files`、`partial_files`、`states`。扫描阶段另看 job.scan_progress：已枚举或待发布数不等于正式索引文件数。失败时报告 error_detail 的阶段、操作和错误码；不要把服务健康当作索引成功。明确列出 failed/blocked/unsupported/online_only/oversized/pending 等实际缺口；需要具体文件时用下面的 list 返回其 `error`、`format_warnings` 和 `content_coverage`。未完成全量分页时不得声称已列尽所有失败文件。
 
 ## 4. 至少一个真实文件 inspect → read
 

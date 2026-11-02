@@ -33,6 +33,8 @@ The source must stay explicit. No evidence query silently changes the configured
 
 For an explicitly requested Windows share upgrade acceptance or an ancestor-directory permission initialization failure, follow [Windows 网络盘正式验收](references/windows-share-acceptance.md). It verifies the installed runtime and the confirmed source through real inspect/read; it is not a setup checklist to repeat for ordinary queries.
 
+For an authorized installation check or failed scan, the bundled `scripts/df-check.py` produces a bounded, content-free report for the confirmed configuration; see [CLI operations](references/cli.md). Track the same job with `job_status`: pre-publication scan counters are progress, not indexed files, and an available service is not proof of a completed inventory. A first share scan that has not published its inventory returns `INDEX_NOT_READY` instead of a successful empty search.
+
 ## Evidence workflow
 
 - Distinguish lookup from exhaustive work. Totals, rankings, absence claims and cross-file comparisons require a defined and completely enumerated population. Search relevance is not completeness.

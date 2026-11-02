@@ -1,6 +1,6 @@
 {
   "name": "team-drive-mcp",
-  "version": "0.6.1",
+  "version": "0.6.2",
   "description": "Local-first, evidence-aware team document reader with MCP tools and an agent skill",
   "private": true,
   "type": "module",

@@ -30,6 +30,7 @@ from .state_pool import JOB_HISTORY_LIMIT, StateLease, pool_settings
 from . import diagnostics as operational
 from .contextual import select_context, plan as evidence_plan
 from .retrieval import Retrieval
+from .scan_progress import ScanProgress, error_detail
 
 
 DEFAULT_LIMITS = {
@@ -192,8 +193,10 @@ class Engine:
         self._session = threading.local()
         self._fatal_error = None
         self._stop = threading.Event()
-        self._scan_lock = threading.Lock()
+        self._scan_lock = threading.RLock()
         self._job_lock = threading.Lock()
+        self._progress_lock = threading.Lock()
+        self._live_progress = {}
         self._queue = queue.Queue()
         self._cancelled = set()
         self._pending_job = None
@@ -277,6 +280,10 @@ class Engine:
                   processed INTEGER NOT NULL DEFAULT 0,error_code TEXT);
             """)
             columns = {r[1] for r in db.execute("PRAGMA table_info(files)")}
+            job_columns = {r[1] for r in db.execute("PRAGMA table_info(jobs)")}
+            for column in ("scan_progress", "error_detail"):
+                if column not in job_columns:
+                    db.execute("ALTER TABLE jobs ADD COLUMN " + column + " TEXT")
             if "format_warnings" not in columns:
                 db.execute("ALTER TABLE files ADD COLUMN format_warnings TEXT NOT NULL DEFAULT '[]'")
             if "extraction_complete" not in columns:
@@ -435,6 +442,7 @@ class Engine:
         with self._db() as db:
             return {"ok": True, "provider": self.provider, "index_generation": self._generation(db),
                     "coverage": self._coverage(db), "limits": self.limits,
+                    "index_status": self._index_status(db),
                     "last_scan_at": json.loads(db.execute("SELECT value FROM meta WHERE key='last_scan_at'").fetchone()[0]),
                     "update_mode": "startup_and_periodic_polling_while_server_runs",
                     "poll_seconds": self.poll_seconds,
@@ -488,7 +496,41 @@ class Engine:
                 row = db.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
             if row is None:
                 raise DriveError("JOB_NOT_FOUND", "No matching indexing job exists.")
-            return {"ok": True, "job": dict(row), "coverage": self._coverage(db)}
+            job = dict(row)
+            for field in ("scan_progress", "error_detail"):
+                job[field] = json.loads(job[field]) if job[field] else None
+            with self._progress_lock:
+                progress = self._live_progress.get(job["id"])
+                if progress is not None:
+                    job["scan_progress"] = progress.snapshot()
+            return {"ok": True, "job": job, "coverage": self._coverage(db),
+                    "index_status": self._index_status(db)}
+
+    def _index_status(self, db):
+        coverage = self._coverage(db)
+        latest = db.execute("SELECT status,error_code FROM jobs ORDER BY created_at DESC LIMIT 1").fetchone()
+        latest_status = latest["status"] if latest else None
+        if latest_status in ("queued", "running"):
+            state = "scanning"
+        elif latest_status in ("failed", "interrupted", "cancelled"):
+            state = "failed" if latest_status != "cancelled" else "cancelled"
+        elif coverage["inventory_complete"]:
+            state = "ready" if coverage["all_present_files_extracted_completely"] else "partial"
+        else:
+            state = "not_ready"
+        return {"state": state, "inventory_complete": coverage["inventory_complete"],
+                "latest_job_status": latest_status, "latest_error_code": latest["error_code"] if latest else None,
+                "indexed_files": coverage["indexed_files"],
+                "meaning": "Service availability is separate from inventory completion and evidence coverage."}
+
+    def _require_share_inventory(self, db):
+        # Existing version-verified candidates remain usable after a failed
+        # refresh. A first, unpublished share inventory is not an empty folder.
+        if self._share_binding:
+            coverage = self._coverage(db)
+            if not coverage["inventory_complete"] and coverage["present_files"] == 0:
+                raise DriveError("INDEX_NOT_READY", "The shared inventory is not ready; an empty result cannot establish absence.",
+                                 True, "Check job_status for scan progress and the task error before querying again.")
 
     def cancel(self, job_id):
         result = self.job_status(job_id)
@@ -706,6 +748,7 @@ class Engine:
         self._check_root()
         prefix, limit = self._prefix(prefix), self._limit(limit)
         with self._db() as db:
+            self._require_share_inventory(db)
             db.execute("BEGIN")
             generation = self._generation(db)
             binding = {"method": "list", "prefix": prefix, "generation": generation}
@@ -753,6 +796,9 @@ class Engine:
         if mode not in ("keyword", "hybrid", "semantic") or not isinstance(rerank, bool):
             raise DriveError("INVALID_PARAMS", "Use keyword, hybrid or semantic search and a boolean rerank flag.")
         groups = self._search_groups(query)
+        if self._share_binding:
+            with self._db() as db:
+                self._require_share_inventory(db)
         if mode != "keyword" or rerank:
             return self._ranked_search(query, prefix, limit, cursor, mode, rerank)
         expression = " OR ".join("(" + " AND ".join('"' + token + '"' for token in group) + ")" for group in groups)
@@ -1155,6 +1201,45 @@ class Engine:
 
     def scan_once(self, job_id=None, force=False):
         """Synchronous scan used by the worker thread and deterministic tests."""
+        # Keep the completed inventory and its final telemetry/checkpoint in
+        # one scan boundary, including for concurrent synchronous callers.
+        with self._scan_lock:
+            return self._scan_tracked(job_id, force)
+
+    def _scan_tracked(self, job_id, force):
+        if job_id is None:
+            job_id = uuid.uuid4().hex
+            with self._db() as db:
+                db.execute("INSERT INTO jobs(id,status,created_at) VALUES(?,'queued',?)", (job_id, time.time()))
+        progress = ScanProgress()
+        started = time.perf_counter()
+        with self._progress_lock:
+            self._live_progress[job_id] = progress
+        try:
+            result = self._scan_once(job_id, force, progress)
+            outcome = result["job"]["status"]
+            progress.finish(outcome)
+            detail = error_detail(DriveError(result["job"]["error_code"], ""), progress) if outcome == "failed" else None
+            with self._db() as db:
+                db.execute("UPDATE jobs SET scan_progress=?,error_detail=? WHERE id=?",
+                           (_json(progress.snapshot()), _json(detail) if detail else None, job_id))
+            if outcome == "complete":
+                self._checkpoint()
+            return self.job_status(job_id)
+        except Exception as exc:
+            progress.finish("failed")
+            detail = error_detail(exc, progress)
+            with self._db() as db:
+                db.execute("UPDATE jobs SET status='failed',error_code=?,finished_at=?,scan_progress=?,error_detail=? WHERE id=?",
+                           (detail["code"], time.time(), _json(progress.snapshot()), _json(detail), job_id))
+                self._prune_jobs(db)
+            self._record_operation("scan", started, {"ok": False, "error": {"code": detail["code"]}})
+            raise
+        finally:
+            with self._progress_lock:
+                self._live_progress.pop(job_id, None)
+
+    def _scan_once(self, job_id, force, progress):
         started = time.perf_counter()
         if self._remote_source:
             self._check_health()
@@ -1176,7 +1261,9 @@ class Engine:
             complete = True
             discovered = 0
             walk_errors = []
-            for relative, info, blocked, online_only in self._source.walk(walk_errors):
+            progress.set_stage("enumerating")
+            entries = self._source.walk(walk_errors, progress=progress) if self._share_binding else self._source.walk(walk_errors)
+            for relative, info, blocked, online_only in entries:
                 if job_id in self._cancelled or self._stop.is_set():
                     complete = False
                     break
@@ -1227,6 +1314,8 @@ class Engine:
                 db.execute("UPDATE meta SET value=? WHERE key='inventory_complete'", ("true" if complete else "false",))
                 db.execute("UPDATE jobs SET discovered=? WHERE id=?", (discovered, job_id))
             processed = 0
+            if complete:
+                progress.set_stage("parsing")
             last_path = ""
             while complete and job_id not in self._cancelled and not self._stop.is_set():
                 with self._db() as db:
@@ -1266,8 +1355,6 @@ class Engine:
                 db.execute("UPDATE jobs SET status=?,finished_at=?,error_code=? WHERE id=?", ("cancelled" if cancelled else "complete" if complete else "failed", time.time(), None if complete else "INVENTORY_INCOMPLETE", job_id))
                 db.execute("UPDATE meta SET value=? WHERE key='last_scan_at'", (_json(time.time()),))
                 self._prune_jobs(db)
-            if complete and not cancelled:
-                self._checkpoint()
             result = self.job_status(job_id)
             self._record_operation("scan", started, {"ok": complete and not cancelled,
                                    "error": {"code": "CANCELLED" if cancelled else "INVENTORY_INCOMPLETE" if not complete else None}})
